@@ -1,0 +1,821 @@
+#!/usr/bin/env bash
+#
+# Meta-Agent-Framework 端到端测试
+#
+# 用法：
+#   npm run test:e2e              # 跑所有 case
+#   npm run test:e2e -- 3         # 只跑 case 3
+#   npm run test:e2e -- 14 15     # 只跑 case 14 和 15
+#   npm run test:e2e -- 13-17     # 跑 case 13 到 17
+#
+# Case 列表：
+#   1  Server 启动
+#   2  OC agent 启动（Plugin → Daemon）
+#   3  Agent 注册验证
+#   4  Skills/MCPs 上报
+#   5  CC agent 注册（共用 Daemon）
+#   6  OTA 写文件
+#   7  OTA Daemon 自更新
+#   8  单 agent 正常退出
+#   9  单 agent 异常退出
+#   10 Daemon 被杀 → 自动恢复
+#   11 Server 重启
+#   12 按需拉起 opencode
+#   13 Claude Code 任务链路
+#   14 Proposal Server API
+#   15 Proposal Daemon 代理
+#   16 Evolve 进化推送
+#   17 SSE 事件广播
+#
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../packages/server" && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$SCRIPT_DIR"
+
+GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
+PASS=0; FAIL=0; TOTAL=0
+SERVER_PID=""; MOCK_PID=""
+
+E2E_STATE_DIR="/tmp/maf-e2e-state"
+E2E_MAF_HOME="/tmp/maf-e2e-home"
+E2E_DB_PATH="/tmp/maf-e2e.db"
+DAEMON_LOG="$HOME/.meta-agent-framework/daemon.log"
+
+# 测试端口（与真实环境隔离）
+E2E_SERVER_PORT=13000
+NODE_PORT=14100
+E2E_SERVER="http://localhost:$E2E_SERVER_PORT"
+DAEMON_URL="http://127.0.0.1:$NODE_PORT"
+
+# ============================================================
+# 参数解析：确定要跑哪些 case
+# ============================================================
+ALL_CASES=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21)
+RUN_CASES=()
+
+if [[ $# -eq 0 ]]; then
+  RUN_CASES=("${ALL_CASES[@]}")
+else
+  for arg in "$@"; do
+    if [[ "$arg" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      # 范围：13-17
+      for i in $(seq "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"); do
+        RUN_CASES+=($i)
+      done
+    elif [[ "$arg" =~ ^[0-9]+$ ]]; then
+      RUN_CASES+=($arg)
+    fi
+  done
+fi
+
+# 判断某个 case 是否需要跑
+should_run() { for c in "${RUN_CASES[@]}"; do [[ "$c" == "$1" ]] && return 0; done; return 1; }
+
+# 计算需要的依赖 setup
+NEED_SERVER=false
+NEED_DAEMON=false
+NEED_CC=false
+for c in "${RUN_CASES[@]}"; do
+  NEED_SERVER=true
+  if [[ $c -ge 2 && $c -le 13 ]] || [[ $c -eq 15 ]] || [[ $c -eq 16 ]] || [[ $c -ge 18 && $c -le 21 ]]; then NEED_DAEMON=true; fi
+  if [[ $c -eq 5 || $c -eq 7 || $c -eq 8 || $c -eq 9 || $c -eq 10 || $c -eq 11 || $c -eq 13 || $c -eq 18 ]]; then NEED_CC=true; fi
+done
+
+# ============================================================
+# 工具函数
+# ============================================================
+assert() {
+  local name=$1 expected=$2 actual=$3
+  TOTAL=$((TOTAL + 1))
+  if echo "$actual" | grep -q "$expected"; then
+    echo -e "  ${GREEN}✅ ${name}${NC}"
+    PASS=$((PASS + 1))
+  else
+    echo -e "  ${RED}❌ ${name}${NC} (want: ${expected}, got: ${actual})"
+    FAIL=$((FAIL + 1))
+    exit 1
+  fi
+}
+
+wait_until() {
+  local max=$1 cmd=$2 pattern=$3
+  for i in $(seq 1 $max); do
+    local val
+    val=$(eval "$cmd" 2>/dev/null)
+    if echo "$val" | grep -q "$pattern" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+get_agent_field() {
+  local field=$1 name=${2:-$AGENT_NAME}
+  curl -s $E2E_SERVER/api/agents 2>/dev/null | \
+    python3 -c "import json,sys;[print(a.get('$field','')) for a in json.load(sys.stdin) if a['agent_name']=='$name']" 2>/dev/null
+}
+
+CC_AGENT="cc-e2e-agent"
+
+start_cc_agent() {
+  MAF_AGENT_NAME="$CC_AGENT" MAF_RUNTIME="claude-code" \
+  MAF_NODE_PORT=$NODE_PORT \
+  MAF_DIRECTORY="/tmp/e2e-cc-project" MAF_USER_ID="e2e-testuser" \
+  META_AGENT_SERVER="$E2E_SERVER" \
+  node plugins/claude-code-plugin-maf/scripts/maf-agent.mjs --daemon --forked &>/dev/null &
+  disown $!
+}
+
+start_mock_opencode() {
+  MOCK_OPENCODE_PORT=$MOCK_PORT \
+  MOCK_PLUGIN_DIR="$PLUGIN_DIR" \
+  MOCK_DIRECTORY="/tmp/e2e-test-project" \
+  META_AGENT_SERVER="$E2E_SERVER" \
+  MAF_USER_ID="e2e-testuser" \
+  MAF_NODE_PORT=$NODE_PORT \
+  node "$ROOT_DIR/scripts/mock-opencode.mjs" "$AGENT_NAME" &>/dev/null &
+  MOCK_PID=$!
+  disown $MOCK_PID
+}
+
+cleanup() {
+  echo -e "\n${YELLOW}清理...${NC}"
+  [[ -n "$MOCK_PID" ]] && kill -9 "$MOCK_PID" 2>/dev/null
+  [[ -n "$SERVER_PID" ]] && kill -9 "$SERVER_PID" 2>/dev/null
+  local DAEMON_PID
+  DAEMON_PID=$(ss -tlnp 2>/dev/null | grep ":${NODE_PORT} " | grep -oP 'pid=\K\d+' | head -1)
+  [[ -n "$DAEMON_PID" ]] && kill -9 "$DAEMON_PID" 2>/dev/null || true
+  pkill -9 -f "maf-agent.mjs.*${NODE_PORT}" 2>/dev/null || true
+  pkill -f "opencode.*serve.*e2e" 2>/dev/null || true
+  sleep 1
+  for p in $E2E_SERVER_PORT $MOCK_PORT $NODE_PORT; do
+    PID=$(ss -tlnp 2>/dev/null | grep ":${p} " | grep -oP 'pid=\K\d+' | head -1)
+    [[ -n "$PID" ]] && kill -9 "$PID" 2>/dev/null || true
+  done
+  rm -f "$E2E_DB_PATH" ~/.meta-agent-framework/ota-e2e-test.txt
+  rm -f /tmp/cc-e2e-stderr.log
+  rm -rf "$E2E_STATE_DIR" "$PLUGIN_DIR" "$E2E_MAF_HOME"
+}
+trap cleanup EXIT
+
+# 从 package.json 读取版本号
+EXPECTED_VERSION=$(python3 -c "import json;print(json.load(open('$SCRIPT_DIR/plugins/opencode-plugin-meta-agent-framework/package.json')).get('version',''))" 2>/dev/null)
+
+# Plugin 目录副本
+PLUGIN_DIR="/tmp/maf-e2e-plugin"
+rm -rf "$PLUGIN_DIR"
+mkdir -p "$PLUGIN_DIR"
+cp "$SCRIPT_DIR/plugins/opencode-plugin-meta-agent-framework"/{index.js,daemon.mjs,package.json} "$PLUGIN_DIR/"
+MOCK_PORT=14096
+AGENT_NAME="e2e-agent"
+
+CASE_TOTAL=${#RUN_CASES[@]}
+echo ""
+echo "╔══════════════════════════════════════════╗"
+echo "║    Meta-Agent-Framework E2E 测试         ║"
+echo "║    v${EXPECTED_VERSION} — Cases: ${RUN_CASES[*]}              ║"
+echo "╚══════════════════════════════════════════╝"
+echo ""
+
+# ============================================================
+# 0. 环境清理 + Setup
+# ============================================================
+echo -e "${YELLOW}[setup] 环境准备${NC}"
+pkill -f "mock-opencode" 2>/dev/null || true
+for p in $E2E_SERVER_PORT $MOCK_PORT $NODE_PORT; do
+  PID=$(ss -tlnp 2>/dev/null | grep ":${p} " | grep -oP 'pid=\K\d+' | head -1)
+  [[ -n "$PID" ]] && kill -9 "$PID" 2>/dev/null || true
+done
+sleep 1
+rm -f "$E2E_DB_PATH"
+rm -rf "$E2E_STATE_DIR" "$E2E_MAF_HOME"
+mkdir -p "$E2E_STATE_DIR" "$E2E_MAF_HOME/state" "$E2E_MAF_HOME/data"
+
+# 启动 Server（所有 case 都需要）
+if $NEED_SERVER; then
+  MAF_HOME="$E2E_MAF_HOME" PORT=$E2E_SERVER_PORT DB_PATH="$E2E_DB_PATH" FEISHU_SYNC_DISABLED=1 ./node_modules/.bin/tsx src/index.ts &>/dev/null &
+  SERVER_PID=$!
+  disown $SERVER_PID
+  sleep 3
+  curl -s $E2E_SERVER/api/health >/dev/null 2>&1 || { echo -e "${RED}❌ Server 启动失败${NC}"; exit 1; }
+  echo "  Server OK (port $E2E_SERVER_PORT)"
+fi
+
+# 启动 Daemon + OC agent
+if $NEED_DAEMON; then
+  start_mock_opencode
+  wait_until 10 "curl -s $DAEMON_URL/health 2>/dev/null" '"ok":true' || { echo -e "${RED}❌ Daemon 启动失败${NC}"; exit 1; }
+  wait_until 10 "get_agent_field status" "online" || true
+  echo "  Daemon + OC agent OK (port $NODE_PORT)"
+fi
+
+# 注册 CC agent
+if $NEED_CC; then
+  start_cc_agent
+  sleep 2
+  wait_until 5 "get_agent_field status $CC_AGENT" "online" || true
+  echo "  CC agent OK"
+fi
+echo ""
+
+# ============================================================
+# Case 1: Server 启动
+# ============================================================
+if should_run 1; then
+echo -e "${YELLOW}[1] Server 启动${NC}"
+H=$(curl -s $E2E_SERVER/api/health 2>/dev/null)
+assert "Server 启动" "server_version" "$H"
+fi
+
+# ============================================================
+# Case 2: OC agent 启动
+# ============================================================
+if should_run 2; then
+echo -e "${YELLOW}[2] OC agent 启动（Plugin → 单 Daemon）${NC}"
+assert "Mock Opencode 运行中" "true" "$(kill -0 $MOCK_PID 2>/dev/null && echo true || echo false)"
+D=$(curl -s "$DAEMON_URL/health" 2>/dev/null || echo "{}")
+assert "Node Daemon 启动" '"ok":true' "$D"
+assert "Daemon hash" "daemon_hash" "$D"
+fi
+
+# ============================================================
+# Case 3: Agent 注册
+# ============================================================
+if should_run 3; then
+echo -e "${YELLOW}[3] Agent 注册${NC}"
+assert "Agent 注册" "$AGENT_NAME" "$(get_agent_field agent_name)"
+assert "状态 online" "online" "$(get_agent_field status)"
+assert "endpoint 指向 Daemon" ":$NODE_PORT" "$(get_agent_field client_endpoint)"
+assert "版本 $EXPECTED_VERSION" "$EXPECTED_VERSION" "$(get_agent_field client_version)"
+fi
+
+# ============================================================
+# Case 4: Skills/MCPs
+# ============================================================
+if should_run 4; then
+echo -e "${YELLOW}[4] Skills/MCPs 上报${NC}"
+SK=$(curl -s $E2E_SERVER/api/agents 2>/dev/null | python3 -c "import json,sys;a=[x for x in json.load(sys.stdin) if x['agent_name']=='$AGENT_NAME'];print(len(json.loads(a[0].get('skills','[]'))) if a else 0)" 2>/dev/null)
+MC=$(curl -s $E2E_SERVER/api/agents 2>/dev/null | python3 -c "import json,sys;a=[x for x in json.load(sys.stdin) if x['agent_name']=='$AGENT_NAME'];print(len(json.loads(a[0].get('mcps','[]'))) if a else 0)" 2>/dev/null)
+assert "Skills > 0" "true" "$([ "${SK:-0}" -gt 0 ] && echo true || echo false)"
+assert "MCPs > 0" "true" "$([ "${MC:-0}" -gt 0 ] && echo true || echo false)"
+fi
+
+# ============================================================
+# Case 5: CC agent 注册
+# ============================================================
+if should_run 5; then
+echo -e "${YELLOW}[5] CC agent 注册（共用 Daemon）${NC}"
+D_HEALTH=$(curl -s $DAEMON_URL/health 2>/dev/null || echo '{}')
+assert "Daemon 管理 OC agent" "$AGENT_NAME" "$D_HEALTH"
+assert "Daemon 管理 CC agent" "$CC_AGENT" "$D_HEALTH"
+wait_until 5 "get_agent_field status $CC_AGENT" "online" || true
+assert "CC 注册 online" "online" "$(get_agent_field status $CC_AGENT)"
+assert "两个 agent 共用 endpoint" ":$NODE_PORT" "$(get_agent_field client_endpoint $CC_AGENT)"
+assert "OC 心跳后 online" "online" "$(get_agent_field status)"
+assert "CC 心跳后 online" "online" "$(get_agent_field status $CC_AGENT)"
+fi
+
+# ============================================================
+# Case 6: OTA 写文件
+# ============================================================
+if should_run 6; then
+echo -e "${YELLOW}[6] OTA 写文件${NC}"
+R=$(curl -s -X POST $DAEMON_URL/ota -H 'Content-Type: application/json' \
+  -d '{"files":[{"path":"~/.meta-agent-framework/ota-e2e-test.txt","content":"e2e-pass"}]}' 2>/dev/null)
+assert "OTA applied" '"applied":1' "$R"
+assert "OTA 内容" "e2e-pass" "$(cat ~/.meta-agent-framework/ota-e2e-test.txt 2>/dev/null)"
+fi
+
+# ============================================================
+# Case 7: OTA Daemon 自更新
+# ============================================================
+if should_run 7; then
+echo -e "${YELLOW}[7] OTA Daemon 自更新${NC}"
+PID_BEFORE=$(curl -s $DAEMON_URL/health 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('pid',''))" 2>/dev/null)
+HASH_BEFORE=$(curl -s $DAEMON_URL/health 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('daemon_hash',''))" 2>/dev/null)
+echo "  OTA 前: PID=$PID_BEFORE hash=$HASH_BEFORE"
+OTA_SELF=$(python3 -c "
+import json, urllib.request
+payload = json.dumps({'files': [{'path': 'plugin/daemon.mjs', 'content': open('plugins/opencode-plugin-meta-agent-framework/daemon.mjs').read()}]})
+req = urllib.request.Request('$DAEMON_URL/ota', data=payload.encode(), headers={'Content-Type':'application/json'}, method='POST')
+try: resp = urllib.request.urlopen(req, timeout=10); print(resp.read().decode())
+except: print('{}')
+" 2>/dev/null || echo "{}")
+assert "OTA daemon_updated" "daemon_updated" "$OTA_SELF"
+echo -n "  等待 Daemon 自杀..."
+sleep 2
+wait_until 3 "curl -s --max-time 1 $DAEMON_URL/health 2>/dev/null || echo dead" "dead" || true
+echo -n " 等待新 Daemon..."
+wait_until 10 "curl -s $DAEMON_URL/health 2>/dev/null" '"ok":true' || true
+wait_until 8 "get_agent_field status" "online" || true
+echo ""
+assert "新 Daemon 启动" '"ok":true' "$(curl -s $DAEMON_URL/health 2>/dev/null || echo '{}')"
+assert "OC OTA 后恢复" "online" "$(get_agent_field status)"
+start_cc_agent
+sleep 2
+wait_until 5 "get_agent_field status $CC_AGENT" "online" || true
+assert "CC 重新注册后 online" "online" "$(get_agent_field status $CC_AGENT)"
+PID_AFTER_RESTART=$(curl -s $DAEMON_URL/health 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('pid',''))" 2>/dev/null)
+echo "  重启完成: PID=$PID_BEFORE → $PID_AFTER_RESTART"
+D_HEALTH=$(curl -s $DAEMON_URL/health 2>/dev/null || echo '{}')
+assert "OC 在 Daemon" "$AGENT_NAME" "$D_HEALTH"
+assert "CC 在 Daemon" "$CC_AGENT" "$D_HEALTH"
+fi
+
+# ============================================================
+# Case 8: 单 agent 正常退出
+# ============================================================
+if should_run 8; then
+echo -e "${YELLOW}[8] 单 agent 正常退出${NC}"
+assert "杀前 OC online" "online" "$(get_agent_field status)"
+assert "杀前 CC online" "online" "$(get_agent_field status $CC_AGENT)"
+kill "$MOCK_PID" 2>/dev/null; MOCK_PID=""
+echo -n "  等待 OC agent offline..."
+wait_until 10 "get_agent_field status" "offline" || true
+echo ""
+assert "OC agent offline" "offline" "$(get_agent_field status)"
+assert "CC agent 仍 online" "online" "$(get_agent_field status $CC_AGENT)"
+assert "Daemon 未退出" '"ok":true' "$(curl -s $DAEMON_URL/health 2>/dev/null || echo '{}')"
+fi
+
+# ============================================================
+# Case 9: 单 agent 异常退出
+# ============================================================
+if should_run 9; then
+echo -e "${YELLOW}[9] 单 agent 异常退出（无 disconnect）${NC}"
+start_mock_opencode
+wait_until 8 "get_agent_field status" "online" || true
+assert "OC 重新上线" "online" "$(get_agent_field status)"
+kill -9 "$MOCK_PID" 2>/dev/null; MOCK_PID=""
+echo -n "  等待 Daemon 检测到 OC 不活跃..."
+wait_until 15 "get_agent_field status" "offline" || true
+echo ""
+assert "OC 异常退出后 offline" "offline" "$(get_agent_field status)"
+assert "CC 不受影响" "online" "$(get_agent_field status $CC_AGENT)"
+assert "Daemon 依然存活" '"ok":true' "$(curl -s $DAEMON_URL/health 2>/dev/null || echo '{}')"
+fi
+
+# ============================================================
+# Case 10: Daemon 被杀 → 自动恢复
+# ============================================================
+if should_run 10; then
+echo -e "${YELLOW}[10] Daemon 被杀 → 自动恢复${NC}"
+start_mock_opencode
+wait_until 8 "get_agent_field status" "online" || true
+DAEMON_PID=$(ss -tlnp 2>/dev/null | grep ":$NODE_PORT " | grep -oP 'pid=\K\d+' | head -1)
+[[ -n "$DAEMON_PID" ]] && kill -9 "$DAEMON_PID" 2>/dev/null
+echo -n "  等待 Daemon 自动恢复..."
+wait_until 10 "curl -s $DAEMON_URL/health 2>/dev/null" '"ok":true' || true
+echo ""
+assert "Daemon 自动恢复" '"ok":true' "$(curl -s $DAEMON_URL/health 2>/dev/null || echo '{}')"
+D_HEALTH=$(curl -s $DAEMON_URL/health 2>/dev/null || echo '{}')
+assert "OC agent 恢复到新 Daemon" "$AGENT_NAME" "$D_HEALTH"
+wait_until 8 "get_agent_field status" "online" || true
+assert "OC Server 侧恢复 online" "online" "$(get_agent_field status)"
+start_cc_agent
+wait_until 5 "get_agent_field status $CC_AGENT" "online" || true
+assert "CC 重新注册 online" "online" "$(get_agent_field status $CC_AGENT)"
+fi
+
+# ============================================================
+# Case 11: Server 重启
+# ============================================================
+if should_run 11; then
+echo -e "${YELLOW}[11] Server 重启${NC}"
+wait_until 5 "curl -s $DAEMON_URL/health 2>/dev/null" '"ok":true' || true
+kill "$SERVER_PID" 2>/dev/null; SERVER_PID=""
+sleep 2
+assert "Server 已停止" "false" "$(curl -s --max-time 1 $E2E_SERVER/api/health &>/dev/null && echo true || echo false)"
+MAF_HOME="$E2E_MAF_HOME" PORT=$E2E_SERVER_PORT DB_PATH="$E2E_DB_PATH" FEISHU_SYNC_DISABLED=1 ./node_modules/.bin/tsx src/index.ts &>/dev/null &
+SERVER_PID=$!
+disown $SERVER_PID
+wait_until 10 "curl -s $E2E_SERVER/api/health 2>/dev/null" "server_version" || true
+assert "Server 重启 health" "server_version" "$(curl -s $E2E_SERVER/api/health 2>/dev/null)"
+wait_until 8 "get_agent_field status" "online" || true
+wait_until 5 "get_agent_field status $CC_AGENT" "online" || true
+assert "OC Server 重启后 online" "online" "$(get_agent_field status)"
+assert "CC Server 重启后 online" "online" "$(get_agent_field status $CC_AGENT)"
+assert "endpoint 正确" ":$NODE_PORT" "$(get_agent_field client_endpoint)"
+fi
+
+# ============================================================
+# Case 12: 按需拉起
+# ============================================================
+if should_run 12; then
+echo -e "${YELLOW}[12] 按需拉起 opencode serve${NC}"
+SERVE_AGENT="serve-e2e-agent"
+mkdir -p /tmp/e2e-serve-project/.opencode/agents
+cat > /tmp/e2e-serve-project/.opencode/agents/${SERVE_AGENT}.md << 'AGENTEOF'
+---
+description: E2E 测试用 serve agent
+mode: subagent
+---
+E2E serve test agent
+AGENTEOF
+curl -s -X POST $DAEMON_URL/agents/connect \
+  -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$SERVE_AGENT\",\"runtime\":\"opencode\",\"directory\":\"/tmp/e2e-serve-project\"}" >/dev/null 2>&1
+sleep 1
+curl -s -X POST $DAEMON_URL/agents/disconnect \
+  -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$SERVE_AGENT\"}" >/dev/null 2>&1
+sleep 1
+wait_until 10 "get_agent_field status $SERVE_AGENT" "offline\|dead" || true
+SERVE_STATUS=$(get_agent_field status $SERVE_AGENT)
+assert "serve agent 已注册(非 online)" "true" "$(echo $SERVE_STATUS | grep -q 'offline\|dead' && echo true || echo false)"
+EXEC_RES=$(curl -s -X POST $DAEMON_URL/execute \
+  -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$SERVE_AGENT\",\"prompt\":\"e2e serve 测试\",\"runtime\":\"opencode\",\"project_path\":\"/tmp/e2e-serve-project\"}" 2>/dev/null)
+assert "按需拉起: 任务已接受" "auto-launch" "$EXEC_RES"
+echo -n "  等待 serve 拉起..."
+wait_until 60 "curl -s $DAEMON_URL/agents 2>/dev/null" "$SERVE_AGENT" || true
+echo ""
+DAEMON_AGENTS=$(curl -s $DAEMON_URL/agents 2>/dev/null)
+assert "按需拉起: agent 出现在 Daemon" "$SERVE_AGENT" "$DAEMON_AGENTS"
+SERVE_PIDS=$(pgrep -f "opencode.*serve" 2>/dev/null | head -1)
+assert "按需拉起: serve 进程存在" "true" "$([ -n \"$SERVE_PIDS\" ] && echo true || echo false)"
+pkill -f "opencode.*serve" 2>/dev/null || true
+rm -rf /tmp/e2e-serve-project
+fi
+
+# ============================================================
+# Case 13: Claude Code 任务链路
+# ============================================================
+if should_run 13; then
+echo -e "${YELLOW}[13] Claude Code: 任务链路${NC}"
+MAF_AGENT_NAME="$CC_AGENT" \
+META_AGENT_SERVER="$E2E_SERVER" \
+MAF_NODE_PORT=$NODE_PORT \
+node plugins/claude-code-plugin-maf/scripts/maf-agent.mjs --wait 2>/tmp/cc-e2e-stderr.log &
+CC_WAIT_PID=$!
+sleep 2
+CC_WF=$(curl -s -X POST $E2E_SERVER/api/workflows \
+  -H 'Content-Type: application/json' \
+  -d "{\"title\":\"CC e2e test\",\"nodes\":[{\"id\":\"step-1\",\"agent_name\":\"$CC_AGENT\",\"prompt\":\"e2e 测试任务\",\"scope\":\"project\",\"intent\":\"query\"}]}" 2>/dev/null)
+CC_WF_ID=$(echo "$CC_WF" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('id','') if not isinstance(d,list) else d[0].get('id','') if d else '')" 2>/dev/null)
+CC_WF_STATUS=$(echo "$CC_WF" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('status','') if not isinstance(d,list) else d[0].get('status','') if d else '')" 2>/dev/null)
+assert "CC workflow 创建" "running" "$CC_WF_STATUS"
+for i in $(seq 1 15); do kill -0 $CC_WAIT_PID 2>/dev/null || break; sleep 1; done
+wait $CC_WAIT_PID 2>/dev/null
+CC_WAIT_EXIT=$?
+assert "CC Wait exit 2" "2" "$CC_WAIT_EXIT"
+CC_STDERR=$(cat /tmp/cc-e2e-stderr.log 2>/dev/null)
+assert "CC stderr 有任务" "e2e 测试任务" "$CC_STDERR"
+assert "CC stderr 有 curl" "tasks/done" "$CC_STDERR"
+CC_TASK_ID=$(echo "$CC_STDERR" | grep -oP '"task_id":"[^"]+' | grep -oP '[^"]+$')
+REPORT_RES=$(curl -s -X POST $DAEMON_URL/tasks/done \
+  -H 'Content-Type: application/json' \
+  -d "{\"task_id\":\"${CC_TASK_ID}\",\"agent_name\":\"$CC_AGENT\",\"status\":\"completed\",\"result\":\"e2e test passed\"}" 2>/dev/null)
+assert "CC 回报到 Daemon" '"ok":true' "$REPORT_RES"
+sleep 3
+WF_STATUS=$(curl -s "$E2E_SERVER/api/workflows/${CC_WF_ID}" 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('status','') if not isinstance(d,list) else d[0].get('status','') if d else '')" 2>/dev/null)
+if [ "$WF_STATUS" != "completed" ]; then sleep 3; WF_STATUS=$(curl -s "$E2E_SERVER/api/workflows/${CC_WF_ID}" 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('status','') if not isinstance(d,list) else d[0].get('status','') if d else '')" 2>/dev/null); fi
+assert "CC workflow completed" "completed" "$WF_STATUS"
+assert "CC 版本" "$EXPECTED_VERSION" "$(get_agent_field client_version $CC_AGENT)"
+fi
+
+# ============================================================
+# Case 14: Proposal Server API
+# ============================================================
+if should_run 14; then
+echo -e "${YELLOW}[14] Proposal: Server API${NC}"
+P_CREATE=$(curl -s -X POST $E2E_SERVER/api/proposals \
+  -H 'Content-Type: application/json' \
+  -d "{\"from_agent\":\"$AGENT_NAME\",\"type\":\"skill\",\"title\":\"好用的 draw-io skill\",\"detail\":\"这个 skill 可以画架构图\",\"user_id\":\"e2e-testuser\",\"files\":[{\"relative_path\":\"SKILL.md\",\"content\":\"# Draw IO Skill\"}],\"priority\":\"high\"}" 2>/dev/null)
+P_ID=$(echo "$P_CREATE" | python3 -c "import json,sys;print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
+assert "创建 proposal" "pending" "$(echo "$P_CREATE" | python3 -c "import json,sys;print(json.load(sys.stdin).get('status',''))" 2>/dev/null)"
+assert "proposal type=skill" "skill" "$(echo "$P_CREATE" | python3 -c "import json,sys;print(json.load(sys.stdin).get('type',''))" 2>/dev/null)"
+assert "proposal priority=high" "high" "$(echo "$P_CREATE" | python3 -c "import json,sys;print(json.load(sys.stdin).get('priority',''))" 2>/dev/null)"
+P_GET=$(curl -s "$E2E_SERVER/api/proposals/$P_ID" 2>/dev/null)
+assert "获取单个 proposal" "draw-io" "$(echo "$P_GET" | python3 -c "import json,sys;print(json.load(sys.stdin).get('title',''))" 2>/dev/null)"
+P_REVIEW=$(curl -s -X POST "$E2E_SERVER/api/proposals/$P_ID/review" \
+  -H 'Content-Type: application/json' \
+  -d '{"status":"accepted","review_comment":"很好的 skill，采纳","reviewed_by":"Meta-Agent-Server"}' 2>/dev/null)
+assert "审核 accepted" "accepted" "$(echo "$P_REVIEW" | python3 -c "import json,sys;print(json.load(sys.stdin).get('status',''))" 2>/dev/null)"
+assert "审核评论" "采纳" "$(echo "$P_REVIEW" | python3 -c "import json,sys;print(json.load(sys.stdin).get('review_comment',''))" 2>/dev/null)"
+P_APPLY=$(curl -s -X POST "$E2E_SERVER/api/proposals/$P_ID/apply" 2>/dev/null)
+assert "标记 applied" "applied" "$(echo "$P_APPLY" | python3 -c "import json,sys;print(json.load(sys.stdin).get('status',''))" 2>/dev/null)"
+P_BAD=$(curl -s -X POST $E2E_SERVER/api/proposals -H 'Content-Type: application/json' -d '{"from_agent":"test"}' 2>/dev/null)
+assert "缺少必填字段返回 error" "error" "$P_BAD"
+fi
+
+# ============================================================
+# Case 15: Proposal Daemon 代理
+# ============================================================
+if should_run 15; then
+echo -e "${YELLOW}[15] Proposal: Daemon 代理${NC}"
+P_DAEMON=$(curl -s -X POST $DAEMON_URL/proposals/submit \
+  -H 'Content-Type: application/json' \
+  -d "{\"from_agent\":\"$AGENT_NAME\",\"type\":\"bug_report\",\"title\":\"workflow step3 顺序有问题\",\"detail\":\"应该先 build 再 test\",\"target\":\"workflow:test-wf\",\"suggested_fix\":\"交换 step3 和 step4\"}" 2>/dev/null)
+P_D_ID=$(echo "$P_DAEMON" | python3 -c "import json,sys;print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
+assert "OC Daemon 代理 proposal" "pending" "$(echo "$P_DAEMON" | python3 -c "import json,sys;print(json.load(sys.stdin).get('status',''))" 2>/dev/null)"
+assert "Daemon proposal type" "bug_report" "$(echo "$P_DAEMON" | python3 -c "import json,sys;print(json.load(sys.stdin).get('type',''))" 2>/dev/null)"
+P_CC=$(curl -s -X POST $DAEMON_URL/proposals/submit \
+  -H 'Content-Type: application/json' \
+  -d "{\"from_agent\":\"$CC_AGENT\",\"type\":\"prompt_improvement\",\"title\":\"Agent prompt 可以优化\",\"detail\":\"建议加入上下文\"}" 2>/dev/null)
+assert "CC Daemon 代理 proposal" "pending" "$(echo "$P_CC" | python3 -c "import json,sys;print(json.load(sys.stdin).get('status',''))" 2>/dev/null)"
+P_REJECT=$(curl -s -X POST "$E2E_SERVER/api/proposals/$P_D_ID/review" \
+  -H 'Content-Type: application/json' \
+  -d '{"status":"rejected","review_comment":"已知问题，下版修复"}' 2>/dev/null)
+assert "审核 rejected" "rejected" "$(echo "$P_REJECT" | python3 -c "import json,sys;print(json.load(sys.stdin).get('status',''))" 2>/dev/null)"
+P_STATS=$(curl -s "$E2E_SERVER/api/proposals/stats" 2>/dev/null)
+assert "stats total >= 3" "true" "$(echo "$P_STATS" | python3 -c "import json,sys;print('true' if json.load(sys.stdin).get('total',0)>=3 else 'false')" 2>/dev/null)"
+assert "stats applied = 1" "true" "$(echo "$P_STATS" | python3 -c "import json,sys;print('true' if json.load(sys.stdin).get('applied',0)==1 else 'false')" 2>/dev/null)"
+P_DLIST=$(curl -s "$DAEMON_URL/proposals?status=pending" 2>/dev/null)
+P_DLCOUNT=$(echo "$P_DLIST" | python3 -c "import json,sys;print(len(json.load(sys.stdin)))" 2>/dev/null)
+assert "Daemon 查询 pending >= 1" "true" "$([ "${P_DLCOUNT:-0}" -ge 1 ] && echo true || echo false)"
+fi
+
+# ============================================================
+# Case 16: Evolve 进化推送
+# ============================================================
+if should_run 16; then
+echo -e "${YELLOW}[16] Evolve: 进化推送${NC}"
+EVOLVE_SKILL=$(curl -s -X POST "$E2E_SERVER/api/evolve/skill" \
+  -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$AGENT_NAME\",\"skill_name\":\"e2e-test-skill\",\"files\":[{\"relative_path\":\"SKILL.md\",\"content\":\"---\nname: e2e-test-skill\ndescription: E2E Test Skill\n---\n# E2E Test Skill\"}]}" 2>/dev/null)
+assert "Evolve skill pushed" "true" "$(echo "$EVOLVE_SKILL" | python3 -c "import json,sys;print(str(json.load(sys.stdin).get('pushed',False)).lower())" 2>/dev/null)"
+EVOLVE_ID=$(echo "$EVOLVE_SKILL" | python3 -c "import json,sys;print(json.load(sys.stdin).get('evolve_id',''))" 2>/dev/null)
+sleep 2
+EVOLVE_RESULT=$(curl -s "$E2E_SERVER/api/evolve/$EVOLVE_ID" 2>/dev/null)
+assert "Evolve 结果 completed" "completed" "$(echo "$EVOLVE_RESULT" | python3 -c "import json,sys;print(json.load(sys.stdin).get('status',''))" 2>/dev/null)"
+EVOLVE_DIRECT=$(curl -s -X POST "$DAEMON_URL/evolve" \
+  -H 'Content-Type: application/json' \
+  -d "{\"evolve_id\":\"e2e-direct-test\",\"title\":\"直接 evolve 测试\",\"target_runtime\":\"opencode\",\"actions\":[{\"type\":\"push_files\",\"target\":\"skill\",\"files\":[{\"relative_path\":\"e2e-direct-skill/SKILL.md\",\"content\":\"---\nname: e2e-direct-skill\ndescription: Direct Test Skill\n---\n# Direct Test\"}]}]}" 2>/dev/null)
+assert "Daemon evolve accepted" "true" "$(echo "$EVOLVE_DIRECT" | python3 -c "import json,sys;print(str(json.load(sys.stdin).get('accepted',False)).lower())" 2>/dev/null)"
+EVOLVE_D_STATUS=$(echo "$EVOLVE_DIRECT" | python3 -c "import json,sys;print(json.load(sys.stdin).get('result',{}).get('status',''))" 2>/dev/null)
+assert "Daemon evolve completed" "completed" "$EVOLVE_D_STATUS"
+SKILL_FILE="$HOME/.config/opencode/skills/e2e-test-skill/SKILL.md"
+assert "Skill 文件已写入" "true" "$([ -f "$SKILL_FILE" ] && echo true || echo false)"
+assert "Skill 文件内容" "true" "$(grep -q 'E2E Test Skill' "$SKILL_FILE" 2>/dev/null && echo true || echo false)"
+EVOLVE_BAD=$(curl -s -X POST "$DAEMON_URL/evolve" \
+  -H 'Content-Type: application/json' \
+  -d '{"evolve_id":"e2e-bad","title":"恶意写入","actions":[{"type":"push_files","target":"custom","target_path":"/tmp","files":[{"relative_path":"evil.sh","content":"rm -rf /"}]}]}' 2>/dev/null)
+EVOLVE_BAD_STATUS=$(echo "$EVOLVE_BAD" | python3 -c "import json,sys;print(json.load(sys.stdin).get('result',{}).get('status',''))" 2>/dev/null)
+assert "白名单外拒绝" "failed" "$EVOLVE_BAD_STATUS"
+rm -rf "$HOME/.config/opencode/skills/e2e-test-skill" "$HOME/.config/opencode/skills/e2e-direct-skill"
+fi
+
+# ============================================================
+# Case 17: SSE 事件广播
+# ============================================================
+if should_run 17; then
+echo -e "${YELLOW}[17] SSE: 事件广播${NC}"
+SSE_OUTPUT="/tmp/maf-e2e-sse.log"
+rm -f "$SSE_OUTPUT"
+curl -s -N "$E2E_SERVER/api/events" > "$SSE_OUTPUT" 2>/dev/null &
+SSE_PID=$!
+sleep 1
+assert "SSE 连接" "true" "$(grep -q 'connected' "$SSE_OUTPUT" 2>/dev/null && echo true || echo false)"
+WF_RES=$(curl -s -X POST $E2E_SERVER/api/workflows \
+  -H 'Content-Type: application/json' \
+  -d "{\"title\":\"SSE 测试 workflow\",\"nodes\":[{\"id\":\"sse-1\",\"agent_name\":\"$AGENT_NAME\",\"prompt\":\"SSE test\",\"scope\":\"project\",\"intent\":\"query\"}]}" 2>/dev/null)
+WF_ID=$(echo "$WF_RES" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('workflow_id','') or d.get('id',''))" 2>/dev/null)
+sleep 1
+curl -s -X POST "$E2E_SERVER/api/workflows/$WF_ID/nodes/sse-1/result" \
+  -H 'Content-Type: application/json' \
+  -d '{"execution_id":"e2e-sse","status":"completed","result":"SSE e2e result OK","duration_ms":100}' >/dev/null 2>&1
+sleep 2
+assert "SSE workflow_started" "true" "$(grep -q 'workflow_started' "$SSE_OUTPUT" 2>/dev/null && echo true || echo false)"
+assert "SSE 含 workflow_id" "true" "$(grep -q "$WF_ID" "$SSE_OUTPUT" 2>/dev/null && echo true || echo false)"
+assert "SSE node 事件" "true" "$(grep -qE 'workflow_node_(running|completed|failed)' "$SSE_OUTPUT" 2>/dev/null && echo true || echo false)"
+kill $SSE_PID 2>/dev/null
+rm -f "$SSE_OUTPUT"
+fi
+
+# ============================================================
+# Case 18: 多任务并发（两个 agent 同时接任务）
+# ============================================================
+if should_run 18; then
+echo -e "${YELLOW}[18] 多任务并发${NC}"
+
+# 确保两个 agent 都 online
+wait_until 5 "get_agent_field status" "online" || true
+wait_until 5 "get_agent_field status $CC_AGENT" "online" || true
+
+# 启动 CC Wait（接收 CC agent 的任务）
+MAF_AGENT_NAME="$CC_AGENT" \
+META_AGENT_SERVER="$E2E_SERVER" \
+MAF_NODE_PORT=$NODE_PORT \
+node plugins/claude-code-plugin-maf/scripts/maf-agent.mjs --wait 2>/tmp/cc-concurrent-stderr.log &
+CC_WAIT_PID=$!
+sleep 2
+
+# 同时创建两个 workflow（分别给 OC 和 CC agent）— 用临时文件捕获后台输出
+curl -s -X POST $E2E_SERVER/api/workflows \
+  -H 'Content-Type: application/json' \
+  -d "{\"title\":\"并发测试-OC\",\"nodes\":[{\"id\":\"c1\",\"agent_name\":\"$AGENT_NAME\",\"prompt\":\"OC并发任务\",\"scope\":\"project\",\"intent\":\"query\"}]}" > /tmp/maf-wf-oc.json 2>/dev/null &
+curl -s -X POST $E2E_SERVER/api/workflows \
+  -H 'Content-Type: application/json' \
+  -d "{\"title\":\"并发测试-CC\",\"nodes\":[{\"id\":\"c2\",\"agent_name\":\"$CC_AGENT\",\"prompt\":\"CC并发任务\",\"scope\":\"project\",\"intent\":\"query\"}]}" > /tmp/maf-wf-cc.json 2>/dev/null &
+wait
+
+WF_OC_ID=$(python3 -c "import json;d=json.load(open('/tmp/maf-wf-oc.json'));print(d.get('workflow_id','') or d.get('id',''))" 2>/dev/null)
+WF_CC_ID=$(python3 -c "import json;d=json.load(open('/tmp/maf-wf-cc.json'));print(d.get('workflow_id','') or d.get('id',''))" 2>/dev/null)
+
+assert "OC workflow 创建" "true" "$([ -n \"$WF_OC_ID\" ] && echo true || echo false)"
+assert "CC workflow 创建" "true" "$([ -n \"$WF_CC_ID\" ] && echo true || echo false)"
+
+# CC agent: 等 Wait 进程退出（收到任务后 exit 2）
+for i in $(seq 1 15); do kill -0 $CC_WAIT_PID 2>/dev/null || break; sleep 1; done
+wait $CC_WAIT_PID 2>/dev/null
+CC_EXIT=$?
+assert "CC 收到任务 (exit 2)" "2" "$CC_EXIT"
+
+# CC 回报结果
+CC_STDERR=$(cat /tmp/cc-concurrent-stderr.log 2>/dev/null)
+CC_TASK_ID=$(echo "$CC_STDERR" | grep -oP '"task_id":"[^"]+' | grep -oP '[^"]+$')
+if [[ -n "$CC_TASK_ID" ]]; then
+  curl -s -X POST $DAEMON_URL/tasks/done \
+    -H 'Content-Type: application/json' \
+    -d "{\"task_id\":\"$CC_TASK_ID\",\"agent_name\":\"$CC_AGENT\",\"status\":\"completed\",\"result\":\"CC并发结果\"}" >/dev/null 2>&1
+fi
+
+# OC agent: 从 Daemon 取任务并回报（mock-opencode 已在运行，但它不会自动回报 workflow 任务）
+# OC workflow 可能已经由 mock-opencode 处理，也可能 pending（取决于 mock 是否处理 workflow 推送）
+# 直接查 workflow 状态，等待完成
+sleep 5
+
+# 验证两个 workflow 的最终状态
+WF_OC_STATUS=$(curl -s "$E2E_SERVER/api/workflows/$WF_OC_ID" 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('status',''))" 2>/dev/null)
+WF_CC_STATUS=$(curl -s "$E2E_SERVER/api/workflows/$WF_CC_ID" 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('status',''))" 2>/dev/null)
+
+assert "CC workflow completed" "completed" "$WF_CC_STATUS"
+# 关键验证：CC 的结果没有串到 OC 的 workflow 里
+WF_OC_RESULT=$(curl -s "$E2E_SERVER/api/workflows/$WF_OC_ID" 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ns=d.get('nodes',[]);print(ns[0].get('result','') if ns else '')" 2>/dev/null)
+assert "结果不串（OC 没收到 CC 结果）" "true" "$(echo "$WF_OC_RESULT" | grep -qv 'CC并发结果' && echo true || echo false)"
+# OC 和 CC 的 workflow_id 不同
+assert "两个 workflow 独立" "true" "$([ \"$WF_OC_ID\" != \"$WF_CC_ID\" ] && echo true || echo false)"
+
+rm -f /tmp/cc-concurrent-stderr.log
+fi
+
+# ============================================================
+# Case 19: Workflow 跟踪查询（pending / completed）
+# ============================================================
+if should_run 19; then
+echo -e "${YELLOW}[19] Workflow 跟踪查询${NC}"
+
+# 用独立 agent 避免 mock-opencode 抢任务
+TRACK_AGENT="track-e2e-agent"
+curl -s -X POST "$DAEMON_URL/agents/connect" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$TRACK_AGENT\",\"runtime\":\"opencode\",\"plugin_pid\":$$,\"directory\":\"/tmp\"}" >/dev/null 2>&1
+sleep 1
+
+# 通过 Daemon /execute 直接推送一个带 workflow_id 的任务
+curl -s -X POST "$DAEMON_URL/execute" \
+  -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$TRACK_AGENT\",\"workflow_id\":\"wf-track-test\",\"node_id\":\"n1\",\"prompt\":\"跟踪测试\",\"intent\":\"query\"}" >/dev/null 2>&1
+
+# 查 pending — 应该有这个 workflow
+PENDING=$(curl -s "$DAEMON_URL/workflows/pending" 2>/dev/null)
+assert "pending 有 workflow" "wf-track-test" "$PENDING"
+PENDING_COUNT=$(echo "$PENDING" | python3 -c "import json,sys;print(len(json.load(sys.stdin)))" 2>/dev/null)
+assert "pending 数量 >= 1" "true" "$([ "${PENDING_COUNT:-0}" -ge 1 ] && echo true || echo false)"
+
+# 取任务并回报完成
+sleep 1
+TASK_DATA=$(curl -s "$DAEMON_URL/tasks/wait?agent=$TRACK_AGENT" --max-time 3 2>/dev/null)
+TASK_ID=$(echo "$TASK_DATA" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('task',{}).get('id',''))" 2>/dev/null)
+if [[ -n "$TASK_ID" && "$TASK_ID" != "None" && "$TASK_ID" != "" ]]; then
+  curl -s -X POST "$DAEMON_URL/tasks/done" \
+    -H 'Content-Type: application/json' \
+    -d "{\"task_id\":\"$TASK_ID\",\"agent_name\":\"$TRACK_AGENT\",\"status\":\"completed\",\"result\":\"跟踪测试结果\"}" >/dev/null 2>&1
+fi
+sleep 1
+
+# 查 completed — 应该有这个 workflow
+COMPLETED=$(curl -s "$DAEMON_URL/workflows/completed" 2>/dev/null)
+assert "completed 有 workflow" "wf-track-test" "$COMPLETED"
+assert "completed 有结果" "跟踪测试结果" "$COMPLETED"
+
+# 查 pending — 应该已经没有了
+PENDING2=$(curl -s "$DAEMON_URL/workflows/pending" 2>/dev/null)
+PENDING2_HAS=$(echo "$PENDING2" | grep -c "wf-track-test" 2>/dev/null || echo 0)
+assert "pending 已清除" "0" "$PENDING2_HAS"
+
+# 清理
+curl -s -X POST "$DAEMON_URL/agents/disconnect" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$TRACK_AGENT\"}" >/dev/null 2>&1
+fi
+
+# ============================================================
+# Case 20: 同 agent 连续串行任务（验证队列不丢）
+# ============================================================
+if should_run 20; then
+echo -e "${YELLOW}[20] 连续串行任务${NC}"
+
+# 用独立 agent 避免和 mock-opencode 冲突
+SERIAL_AGENT="serial-e2e-agent"
+curl -s -X POST "$DAEMON_URL/agents/connect" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$SERIAL_AGENT\",\"runtime\":\"opencode\",\"plugin_pid\":$$,\"directory\":\"/tmp\"}" >/dev/null 2>&1
+sleep 1
+
+# 启动 worker：持续 poll + 执行 + 回报
+(while true; do
+  RESP=$(curl -s "$DAEMON_URL/tasks/wait?agent=$SERIAL_AGENT" --max-time 3 2>/dev/null)
+  TID=$(echo "$RESP" | python3 -c "import json,sys;d=json.load(sys.stdin);t=d.get('task');print(t.get('id','') if t else '')" 2>/dev/null)
+  if [[ -n "$TID" && "$TID" != "" ]]; then
+    sleep 1  # 模拟执行
+    curl -s -X POST "$DAEMON_URL/tasks/done" -H 'Content-Type: application/json' \
+      -d "{\"task_id\":\"$TID\",\"agent_name\":\"$SERIAL_AGENT\",\"status\":\"completed\",\"result\":\"done-$TID\"}" >/dev/null
+  fi
+done) &
+SERIAL_WORKER=$!
+sleep 2  # 等 worker long-poll 建立
+
+# 连续发 3 个任务
+R1=$(curl -s -X POST "$DAEMON_URL/execute" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$SERIAL_AGENT\",\"workflow_id\":\"serial-1\",\"node_id\":\"n1\",\"prompt\":\"串行任务1\",\"intent\":\"query\"}" 2>/dev/null)
+R2=$(curl -s -X POST "$DAEMON_URL/execute" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$SERIAL_AGENT\",\"workflow_id\":\"serial-2\",\"node_id\":\"n2\",\"prompt\":\"串行任务2\",\"intent\":\"query\"}" 2>/dev/null)
+R3=$(curl -s -X POST "$DAEMON_URL/execute" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$SERIAL_AGENT\",\"workflow_id\":\"serial-3\",\"node_id\":\"n3\",\"prompt\":\"串行任务3\",\"intent\":\"query\"}" 2>/dev/null)
+
+assert "串行任务1 accepted" "true" "$(echo "$R1" | python3 -c "import json,sys;print(str(json.load(sys.stdin).get('accepted',False)).lower())" 2>/dev/null)"
+assert "串行任务2 accepted" "true" "$(echo "$R2" | python3 -c "import json,sys;print(str(json.load(sys.stdin).get('accepted',False)).lower())" 2>/dev/null)"
+assert "串行任务3 accepted" "true" "$(echo "$R3" | python3 -c "import json,sys;print(str(json.load(sys.stdin).get('accepted',False)).lower())" 2>/dev/null)"
+
+# 等所有任务执行完（3 个任务各 1s 执行 + poll 间隔）
+sleep 12
+
+# 验证 3 个都完成了
+COMPLETED=$(curl -s "$DAEMON_URL/workflows/completed" 2>/dev/null)
+C1=$(echo "$COMPLETED" | python3 -c "import json,sys;print('true' if any(w['workflow_id']=='serial-1' and w['status']=='completed' for w in json.load(sys.stdin)) else 'false')" 2>/dev/null)
+C2=$(echo "$COMPLETED" | python3 -c "import json,sys;print('true' if any(w['workflow_id']=='serial-2' and w['status']=='completed' for w in json.load(sys.stdin)) else 'false')" 2>/dev/null)
+C3=$(echo "$COMPLETED" | python3 -c "import json,sys;print('true' if any(w['workflow_id']=='serial-3' and w['status']=='completed' for w in json.load(sys.stdin)) else 'false')" 2>/dev/null)
+
+assert "串行任务1 completed" "true" "$C1"
+assert "串行任务2 completed" "true" "$C2"
+assert "串行任务3 completed" "true" "$C3"
+
+# 清理
+kill $SERIAL_WORKER 2>/dev/null
+curl -s -X POST "$DAEMON_URL/agents/disconnect" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$SERIAL_AGENT\"}" >/dev/null 2>&1
+fi
+
+# ============================================================
+# Case 21: OC Workflow 完整链路（Server API → Daemon → Plugin → 回报 → completed）
+# ============================================================
+if should_run 21; then
+echo -e "${YELLOW}[21] OC Workflow 完整链路${NC}"
+
+# 用独立 agent + worker
+OC_WF_AGENT="oc-wf-e2e-agent"
+curl -s -X POST "$DAEMON_URL/agents/connect" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$OC_WF_AGENT\",\"runtime\":\"opencode\",\"plugin_pid\":$$,\"directory\":\"/tmp\"}" >/dev/null 2>&1
+sleep 2  # 等 Daemon 心跳注册到 Server
+
+# 启动 worker（模拟 Plugin long-poll + 执行 + 回报）
+(while true; do
+  RESP=$(curl -s "$DAEMON_URL/tasks/wait?agent=$OC_WF_AGENT" --max-time 3 2>/dev/null)
+  TID=$(echo "$RESP" | python3 -c "import json,sys;d=json.load(sys.stdin);t=d.get('task');print(t.get('id','') if t else '')" 2>/dev/null)
+  if [[ -n "$TID" && "$TID" != "" ]]; then
+    sleep 1
+    curl -s -X POST "$DAEMON_URL/tasks/done" -H 'Content-Type: application/json' \
+      -d "{\"task_id\":\"$TID\",\"agent_name\":\"$OC_WF_AGENT\",\"status\":\"completed\",\"result\":\"OC workflow 执行结果 OK\"}" >/dev/null
+  fi
+done) &
+OC_WF_WORKER=$!
+sleep 2  # 等 worker long-poll 建立
+
+# 通过 Server API 创建 workflow
+OC_WF_RES=$(curl -s -X POST "$E2E_SERVER/api/workflows" \
+  -H 'Content-Type: application/json' \
+  -d "{\"title\":\"OC 完整链路测试\",\"nodes\":[{\"id\":\"oc-1\",\"agent_name\":\"$OC_WF_AGENT\",\"prompt\":\"OC e2e 全链路\",\"scope\":\"project\",\"intent\":\"query\"}]}" 2>/dev/null)
+OC_WF_ID=$(echo "$OC_WF_RES" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('workflow_id','') or d.get('id',''))" 2>/dev/null)
+OC_WF_STATUS=$(echo "$OC_WF_RES" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('status',''))" 2>/dev/null)
+
+assert "OC workflow 创建" "running" "$OC_WF_STATUS"
+
+# 等 workflow 完成（Server 收到 Daemon 回报）
+sleep 8
+FINAL_STATUS=$(curl -s "$E2E_SERVER/api/workflows/$OC_WF_ID" 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('status',''))" 2>/dev/null)
+assert "OC workflow completed" "completed" "$FINAL_STATUS"
+
+# 验证结果内容
+FINAL_RESULT=$(curl -s "$E2E_SERVER/api/workflows/$OC_WF_ID" 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ns=d.get('nodes',[]);print(ns[0].get('result','') if ns else '')" 2>/dev/null)
+assert "OC workflow 有结果" "OC workflow 执行结果 OK" "$FINAL_RESULT"
+
+# 清理
+kill $OC_WF_WORKER 2>/dev/null
+curl -s -X POST "$DAEMON_URL/agents/disconnect" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$OC_WF_AGENT\"}" >/dev/null 2>&1
+fi
+
+# ============================================================
+# 结果
+# ============================================================
+echo ""
+echo "══════════════════════════════════════════"
+if [[ $FAIL -eq 0 ]]; then
+  echo -e "${GREEN}全部通过: ${PASS}/${TOTAL}${NC}"
+else
+  echo -e "${RED}失败: ${FAIL}/${TOTAL} (通过: ${PASS})${NC}"
+fi
+echo "══════════════════════════════════════════"
+echo ""
+exit $FAIL

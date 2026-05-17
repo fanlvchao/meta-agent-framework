@@ -1,0 +1,14 @@
+{
+  "name": "meta-agent-framework",
+  "private": true,
+  "description": "Meta-Agent-Framework monorepo — 分布式 AI Agent 编排调度框架",
+  "scripts": {
+    "install:local": "bash scripts/sync-client-pkg.sh && cd packages/server && npm pack && npm install -g maf-meta-agent-server-*.tgz && rm -f maf-meta-agent-server-*.tgz && cd ../client && npm pack && npm install -g maf-meta-agent-client-*.tgz && rm -f maf-meta-agent-client-*.tgz",
+    "uninstall:local": "maf-server stop 2>/dev/null; maf-client uninstall 2>/dev/null; npm uninstall -g @maf/meta-agent-server @maf/meta-agent-client 2>/dev/null; rm -rf ~/.meta-agent-framework; echo '✅ 卸载完成'",
+    "test:e2e": "bash scripts/test-e2e.sh",
+    "dev": "cd packages/server && npm run dev",
+    "build": "cd packages/server && npm run build"
+  },
+  "license": "MIT",
+  "author": "fanlvchao <fanlvchao@gmail.com>"
+}

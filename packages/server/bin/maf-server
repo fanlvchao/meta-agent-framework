@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# maf-server CLI wrapper — 调用同目录的 maf-server.mjs（ESM）
+REAL_PATH="$(readlink -f "$0")"
+exec node "$(dirname "$REAL_PATH")/maf-server.mjs" "$@"

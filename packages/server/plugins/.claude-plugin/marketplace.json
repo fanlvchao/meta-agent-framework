@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "maf-plugins",
+  "description": "Meta-Agent Framework plugins — 让 Claude Code 接入分布式 Agent 网络",
+  "owner": {
+    "name": "Meta-Agent-Framework",
+    "email": ""
+  },
+  "plugins": [
+    {
+      "name": "maf",
+      "description": "Meta-Agent Framework — 让 Claude Code 接入分布式 Agent 网络，接收远程任务并回报结果",
+      "category": "productivity",
+      "source": "./claude-code-plugin-maf"
+    }
+  ]
+}

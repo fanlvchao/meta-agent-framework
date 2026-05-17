@@ -1,0 +1,1488 @@
+#!/usr/bin/env node
+/**
+ * Meta-Agent-Framework Node Daemon（驻地代理）
+ *
+ * 一台机器一个常驻进程，管理本机所有 agent。
+ * 支持 opencode Plugin 和 Claude Code hook 两种 Client 连接。
+ *
+ * 职责：
+ *   1. 管理本机所有 agent（注册/心跳/状态跟踪）
+ *   2. 扫描 skills/mcps 上报（机器级别，所有 agent 共享）
+ *   3. 按 agent_name 路由任务（Server → Daemon → 对应 Plugin/Hook）
+ *   4. 接收 OTA → 更新自身 → 自重启
+ *   5. HTTP server 供 Server 和 Plugin/Hook 通信
+ *
+ * 环境变量：
+ *   MAF_NODE_PORT      — HTTP 端口（默认 4100）
+ *   MAF_AGENT_NAME     — 初始 agent 名称（可选，Claude Code --daemon 传入）
+ *   MAF_RUNTIME        — 初始 agent 的运行时：opencode（默认）| claude-code
+ *   MAF_DIRECTORY      — 工作目录
+ *   MAF_PLUGIN_DIR     — Plugin 安装目录
+ *   MAF_PARENT_PID     — 仅 Claude Code 首次拉起时使用（不再跟随退出）
+ */
+
+import { createServer } from "node:http";
+import { spawn, execSync } from "node:child_process";
+import { writeFileSync, readFileSync, existsSync, mkdirSync, unlinkSync, appendFileSync, readdirSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { homedir, userInfo, networkInterfaces } from "node:os";
+import { createHash } from "node:crypto";
+
+// ============================================================
+// 配置（从 maf.config.json / 环境变量读取）
+// ============================================================
+
+/** 读取 maf.config.json（全局 > 项目级），环境变量优先 */
+function loadMafConfig() {
+  const paths = [
+    join(homedir(), ".meta-agent-framework", "maf.config.json"),
+    join(process.cwd(), "maf.config.json"),
+  ];
+  let cfg = {};
+  for (const p of paths) {
+    try { if (existsSync(p)) cfg = { ...cfg, ...JSON.parse(readFileSync(p, "utf-8")) }; } catch {}
+  }
+  return cfg;
+}
+const _mafCfg = loadMafConfig();
+
+const NODE_PORT = parseInt(process.env.MAF_NODE_PORT || "0") || parseInt(process.env.MAF_DAEMON_PORT || "0") || _mafCfg.daemon?.port || 4100;
+const DIRECTORY = process.env.MAF_DIRECTORY || process.cwd();
+const PLUGIN_DIR = process.env.MAF_PLUGIN_DIR || dirname(new URL(import.meta.url).pathname);
+const META_AGENT_SERVER = process.env.META_AGENT_SERVER || _mafCfg.server?.url || "";
+if (!META_AGENT_SERVER) {
+  console.error("[node-daemon] ❌ META_AGENT_SERVER 未配置！运行 npm run init 或设置环境变量 META_AGENT_SERVER");
+}
+const CLIENT_VERSION = (() => {
+  try { return JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf-8")).version || "0.0.0"; }
+  catch { return "0.0.0"; }
+})();
+const HEARTBEAT_INTERVAL = 1_000;
+const POLL_INTERVAL = 1_000;
+const STATE_DIR = join(homedir(), ".meta-agent-framework");
+
+process.title = "MAF_Node_Daemon";
+mkdirSync(STATE_DIR, { recursive: true });
+
+// ============================================================
+// 日志
+// ============================================================
+const LOG_FILE = join(STATE_DIR, "daemon.log");
+function log(msg) {
+  const line = `${new Date().toISOString().slice(11, 23)} [node-daemon] ${msg}`;
+  // 只写文件，不用 console.error（detached 进程 stderr 可能 EPIPE）
+  try { appendFileSync(LOG_FILE, line + "\n"); } catch {}
+}
+
+// ============================================================
+// 工具函数
+// ============================================================
+function getLocalIP() {
+  for (const ifaces of Object.values(networkInterfaces())) {
+    for (const iface of ifaces || []) {
+      if (!iface.internal && iface.family === "IPv4") return iface.address;
+    }
+  }
+  return "127.0.0.1";
+}
+
+function fileHash(path) {
+  try { return createHash("sha256").update(readFileSync(path, "utf-8")).digest("hex").substring(0, 16); } catch { return ""; }
+}
+
+function detectUserId() {
+  if (process.env.MAF_USER_ID) return process.env.MAF_USER_ID;
+  try {
+    return execSync("git config user.email", { encoding: "utf-8" }).trim().split("@")[0];
+  } catch { return userInfo().username; }
+}
+
+const DAEMON_SELF_HASH = fileHash(join(PLUGIN_DIR, "daemon.mjs"));
+
+// ============================================================
+// Agent Manager — 管理本机所有 agent
+// ============================================================
+// agents Map: agent_name → { runtime, pluginPid, directory, registered, sessionId, lastSeen }
+const agents = new Map();
+
+// 每个 agent 独立的任务队列
+// taskQueues Map: agent_name → { pending, lastExecuted, waitingResponse, executingTaskId }
+const taskQueues = new Map();
+
+// Workflow 跟踪表：记录经过此 Daemon 的所有 workflow 任务状态
+// workflowTracker Map: workflow_id → { title, agent_name, node_id, status, dispatched_at, completed_at, result }
+const workflowTracker = new Map();
+
+let userId = "";
+let hostUser = userInfo().username;
+let daemonUrl = "";
+let lastInventoryFP = "";
+
+// agent 存活检测：Plugin/Wait 通过 long-poll 或 connect 保持心跳
+// 超过此时间未活跃视为 offline（Plugin 退出但 disconnect 没发出的情况）
+const AGENT_ALIVE_TIMEOUT = 5_000;  // 5s（long-poll 2s 周期 × 2 + 裕量）
+
+const MAX_QUEUE_SIZE = 10;
+
+function getAgentQueue(agentName) {
+  if (!taskQueues.has(agentName)) {
+    taskQueues.set(agentName, { pending: [], lastExecuted: null, waitingResponse: null, executingTaskId: null });
+  }
+  return taskQueues.get(agentName);
+}
+
+/** 更新 agent 最后活跃时间 */
+function touchAgent(agentName) {
+  const info = agents.get(agentName);
+  if (info) info.lastSeen = Date.now();
+}
+
+/** 检查 Plugin 进程是否存活（通过 /proc/{pid}） */
+function isProcessAlive(pid) {
+  if (!pid) return false;
+  try { return existsSync(`/proc/${pid}`); } catch { return false; }
+}
+
+/**
+ * 清理已死的 agent：Plugin 进程死了 + lastSeen 超时 + 没在执行任务 + 没有 screen 在跑
+ * 从 agents Map 移除，不再上报给 Server，让 Server 自然心跳超时降级
+ */
+function pruneDeadAgents() {
+  const now = Date.now();
+  for (const [name, info] of agents) {
+    if (info.runtime === "claude-code") continue;  // CC 模式不用 long-poll，不清理
+    const q = taskQueues.get(name);
+    if (q?.executingTaskId) continue;  // 正在执行任务，不清理
+
+    // Plugin 进程还活着，不清理
+    if (isProcessAlive(info.pluginPid)) continue;
+
+    // lastSeen 还没超时，不清理（刚退出的短暂窗口期，可能马上重连）
+    if (info.lastSeen && now - info.lastSeen <= AGENT_ALIVE_TIMEOUT) continue;
+
+    // 有 screen 在跑（按需拉起的 TUI），不清理
+    const screenName = `maf-${name}`;
+    try {
+      const check = execSync(`screen -ls ${screenName} 2>/dev/null`, { encoding: "utf-8", timeout: 2000 });
+      if (check.includes(screenName)) continue;
+    } catch {}
+
+    // 确认死了，移除
+    agents.delete(name);
+    if (q?.waitingResponse) {
+      try { q.waitingResponse.writeHead(200, { "Content-Type": "application/json" }); q.waitingResponse.end('{"task":null}'); } catch {}
+    }
+    taskQueues.delete(name);
+    log(`🗑 agent ${name} 已移除（Plugin 进程死亡 + 无 screen）`);
+  }
+}
+
+function getAgentStatuses() {
+  const now = Date.now();
+  const statuses = {};
+  for (const [name, info] of agents) {
+    const q = taskQueues.get(name);
+
+    // claude-code 模式：没有持续 long-poll，只在 connect/wait 时刷新，不能用短超时判断
+    if (info.runtime === "claude-code") {
+      statuses[name] = q?.executingTaskId ? "busy" : "online";
+      continue;
+    }
+
+    // opencode 模式：优先看任务执行状态
+    if (q?.executingTaskId) {
+      // 正在执行任务 → busy（即使 long-poll 暂时停了也不影响）
+      // 兜底：检查 Plugin 进程是否还活着
+      if (isProcessAlive(info.pluginPid)) {
+        statuses[name] = "busy";
+      } else {
+        // Plugin 进程已死，但任务没有完成 → 标记 offline（靠 Server 超时处理）
+        log(`⚠ ${name} 正在执行任务但 Plugin(pid=${info.pluginPid}) 已死`);
+        q.executingTaskId = null;
+        statuses[name] = "offline";
+      }
+    } else if (info.lastSeen && now - info.lastSeen > AGENT_ALIVE_TIMEOUT) {
+      // 没在执行任务 + lastSeen 超时
+      // 兜底：检查 Plugin 进程是否还活着（进程在但事件循环忙 → online）
+      if (isProcessAlive(info.pluginPid)) {
+        statuses[name] = "online";
+      } else {
+        statuses[name] = "offline";
+      }
+    } else {
+      statuses[name] = "online";
+    }
+  }
+  return statuses;
+}
+
+// ============================================================
+// Serve 进程管理 — 按需拉起 opencode serve 执行任务
+// ============================================================
+// serveProcesses Map: agent_name → { proc, port, startedAt, lastTaskAt }
+const serveProcesses = new Map();
+const SERVE_IDLE_TIMEOUT = 10 * 60_000; // 10 分钟无任务自动退出
+
+/**
+ * 按需拉起 opencode TUI（通过 screen 运行在虚拟终端中）
+ * opencode TUI 加载 Plugin → Plugin connect Daemon → long-poll 接任务
+ * 用户可通过 screen -r maf-{agent} 附上去查看/操作
+ * 返回 true=拉起成功, false=失败
+ */
+async function spawnAgent(agentName, projectPath, agentRuntime) {
+  const screenName = `maf-${agentName}`;
+
+  // 已有 screen 在跑，直接复用
+  const existing = serveProcesses.get(agentName);
+  if (existing) {
+    try {
+      const check = execSync(`screen -ls ${screenName} 2>/dev/null`, { encoding: "utf-8" });
+      if (check.includes(screenName)) {
+        existing.lastTaskAt = Date.now();
+        return true;
+      }
+    } catch {}
+    // screen 不在了，清理
+    serveProcesses.delete(agentName);
+  }
+
+  const rawCwd = projectPath || DIRECTORY;
+  const cwd = rawCwd.startsWith("~") ? rawCwd.replace(/^~/, homedir()) : rawCwd;
+  const agentInfo = agents.get(agentName);
+  const runtime = agentRuntime || agentInfo?.runtime || "opencode";
+
+  // 预检查
+  try { execSync("which screen", { stdio: "ignore", timeout: 2000 }); } catch {
+    log(`❌ screen 未安装，无法拉起 agent`);
+    return false;
+  }
+
+  const cli = runtime === "claude-code" ? "claude" : "opencode";
+  try { execSync(`which ${cli}`, { stdio: "ignore", timeout: 2000 }); } catch {
+    log(`❌ ${cli} 未安装，无法拉起 ${runtime} agent`);
+    return false;
+  }
+
+  if (!existsSync(cwd)) {
+    log(`❌ 目录不存在: ${cwd}`);
+    return false;
+  }
+
+  // 根据 runtime 构建拉起命令
+  let cmd;
+  if (runtime === "claude-code") {
+    cmd = `screen -dmS ${screenName} bash -c 'cd "${cwd}" && claude --agent ${agentName}'`;
+    log(`🚀 拉起 claude TUI (screen): agent=${agentName} cwd=${cwd} session=${screenName}`);
+  } else {
+    cmd = `screen -dmS ${screenName} bash -c 'cd "${cwd}" && export MAF_INITIAL_AGENT=${agentName} && opencode --agent ${agentName} --hostname localhost'`;
+    log(`🚀 拉起 opencode TUI (screen): agent=${agentName} cwd=${cwd} session=${screenName}`);
+  }
+
+  try {
+    execSync(cmd, { timeout: 5000, stdio: "ignore" });
+  } catch (err) {
+    log(`❌ screen 拉起失败: ${err.message}`);
+    return false;
+  }
+
+  serveProcesses.set(agentName, {
+    proc: null,  // screen 管理进程，不需要直接引用
+    screenName,
+    startedAt: Date.now(),
+    lastTaskAt: Date.now(),
+  });
+
+  log(`✅ screen session 已创建: ${screenName}`);
+
+  // 等 Plugin connect + long-poll 就绪
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 1000));
+    if (agents.has(agentName)) {
+      const q = taskQueues.get(agentName);
+      if (q?.waitingResponse) {
+        log(`✅ agent 就绪: ${agentName} (${i + 1}s)`);
+        return true;
+      }
+    }
+  }
+  log(`⚠ agent 未就绪（任务仍在队列等待）: ${agentName}`);
+  return true; // screen 在跑，Plugin 可能稍后就绪
+}
+
+/** 清理空闲的 screen 进程 */
+function cleanIdleServes() {
+  const now = Date.now();
+  for (const [name, info] of serveProcesses) {
+    if (now - info.lastTaskAt > SERVE_IDLE_TIMEOUT) {
+      log(`🗑 agent 空闲超时，关闭 screen: ${name} (${info.screenName})`);
+      try { execSync(`screen -S ${info.screenName} -X quit 2>/dev/null`, { stdio: "ignore" }); } catch {}
+      serveProcesses.delete(name);
+    }
+  }
+}
+
+/** 清理所有 screen 进程（Daemon 退出时） */
+function cleanAllServes() {
+  for (const [name, info] of serveProcesses) {
+    try { execSync(`screen -S ${info.screenName} -X quit 2>/dev/null`, { stdio: "ignore" }); } catch {}
+  }
+  serveProcesses.clear();
+}
+
+/** 定期清理长期不活跃的 agent（1 小时无活跃则移除，仅清理真正被遗忘的残留） */
+function cleanDeadAgents() {
+  const now = Date.now();
+  const DEAD_TIMEOUT = 60 * 60_000;
+  for (const [name, info] of agents) {
+    if (now - (info.lastSeen || 0) > DEAD_TIMEOUT) {
+      agents.delete(name);
+      const q = taskQueues.get(name);
+      if (q?.waitingResponse) {
+        try { q.waitingResponse.writeHead(200, { "Content-Type": "application/json" }); q.waitingResponse.end('{"task":null}'); } catch {}
+      }
+      taskQueues.delete(name);
+      log(`🗑 agent ${name} 长期不活跃，已移除`);
+    }
+  }
+}
+
+// ============================================================
+// Skills / MCPs 扫描（机器级别，所有 agent 共享）
+// ============================================================
+function scanSkills() {
+  const dirs = [
+    join(DIRECTORY, ".opencode", "skills"),
+    join(DIRECTORY, ".claude", "skills"),
+    join(DIRECTORY, ".agents", "skills"),
+    join(homedir(), ".config", "opencode", "skills"),
+    join(homedir(), ".opencode", "skills"),
+    join(homedir(), ".claude", "skills"),
+    join(homedir(), ".agents", "skills"),
+  ];
+  const seen = new Set();
+  const skills = [];
+  for (const d of dirs) {
+    if (!existsSync(d)) continue;
+    try {
+      for (const e of readdirSync(d, { withFileTypes: true })) {
+        if (!e.isDirectory() || seen.has(e.name) || e.name.startsWith("_") || e.name.startsWith(".")) continue;
+        seen.add(e.name);
+        const skill = { name: e.name };
+        const md = join(d, e.name, "SKILL.md");
+        if (existsSync(md)) {
+          try {
+            for (const line of readFileSync(md, "utf-8").split("\n")) {
+              const t = line.trim();
+              if (t && !t.startsWith("#")) { skill.description = t.substring(0, 200); break; }
+            }
+          } catch {}
+        }
+        skills.push(skill);
+      }
+    } catch {}
+  }
+  return skills;
+}
+
+function scanMcps() {
+  const opencodePaths = [
+    join(homedir(), ".config", "opencode", "opencode.json"),
+    join(homedir(), ".opencode", "opencode.json"),
+    join(DIRECTORY, "opencode.json"),
+    join(DIRECTORY, ".opencode", "opencode.json"),
+  ];
+  const claudePaths = [
+    join(DIRECTORY, ".mcp.json"),
+    join(homedir(), ".claude", ".mcp.json"),
+    join(homedir(), ".claude", "claude_desktop_config.json"),
+  ];
+  const seen = new Set();
+  const mcps = [];
+  for (const p of opencodePaths) {
+    if (!existsSync(p)) continue;
+    try {
+      const c = JSON.parse(readFileSync(p, "utf-8"));
+      for (const [name, mcp] of Object.entries(c.mcp || {})) {
+        if (seen.has(name)) continue;
+        seen.add(name);
+        mcps.push({
+          name,
+          type: mcp.type || (mcp.command ? "local" : mcp.url ? "remote" : "unknown"),
+          enabled: mcp.enabled !== false,
+        });
+      }
+    } catch {}
+  }
+  for (const p of claudePaths) {
+    if (!existsSync(p)) continue;
+    try {
+      const c = JSON.parse(readFileSync(p, "utf-8"));
+      for (const [name, mcp] of Object.entries(c.mcpServers || {})) {
+        if (seen.has(name)) continue;
+        seen.add(name);
+        mcps.push({
+          name,
+          type: mcp.command ? "local" : mcp.url ? "remote" : "unknown",
+          enabled: mcp.disabled !== true,
+        });
+      }
+    } catch {}
+  }
+  return mcps;
+}
+
+function inventoryFP(skills, mcps) {
+  return JSON.stringify({ s: skills.map(s => s.name).sort(), m: mcps.map(m => m.name).sort() });
+}
+
+// ============================================================
+// Agent 定义读取
+// ============================================================
+function readAgentMeta(filePath) {
+  try {
+    const raw = readFileSync(filePath, "utf-8");
+    const fmMatch = raw.match(/^---\n([\s\S]*?)\n---/);
+    if (!fmMatch) return null;
+    const meta = {};
+    for (const line of fmMatch[1].split("\n")) {
+      const m = line.match(/^(\w+):\s*(.+)/);
+      if (m) meta[m[1]] = m[2].trim().replace(/^["']|["']$/g, "");
+    }
+    return { capabilities: meta.description || "", mode: meta.mode || "subagent", runtime: meta.runtime || "opencode" };
+  } catch { return null; }
+}
+
+function findAgentDef(name, runtime, agentDirectory) {
+  // agentDirectory: 该 agent 自己的项目目录（来自 /agents/connect 传入）
+  const dir = agentDirectory || DIRECTORY;
+  const paths = [
+    join(dir, ".opencode", "agents", `${name}.md`),
+    join(homedir(), ".config", "opencode", "agents", `${name}.md`),
+    join(dir, ".claude", "agents", `${name}.md`),
+    join(homedir(), ".claude", "agents", `${name}.md`),
+  ];
+  let base = { agent_name: name, project_path: dir, capabilities: "", mode: "subagent", runtime: runtime || "opencode" };
+  for (const p of paths) {
+    if (existsSync(p)) {
+      const meta = readAgentMeta(p);
+      if (meta) { base = { ...base, ...meta, runtime: runtime || "opencode" }; break; }
+    }
+  }
+  base.skills = scanSkills();
+  base.mcps = scanMcps();
+  return base;
+}
+
+// ============================================================
+// Server 通信：注册 / 心跳
+// ============================================================
+async function registerToServer() {
+  // 先清理已死的 agent（Plugin 死了 + lastSeen 超时 + 无 screen）
+  pruneDeadAgents();
+
+  if (agents.size === 0) return;
+  const agentDefs = [];
+  for (const [name, info] of agents) {
+    agentDefs.push(findAgentDef(name, info.runtime, info.directory));
+  }
+
+  try {
+    const res = await fetch(`${META_AGENT_SERVER}/api/clients/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        user_id: userId,
+        host_user: hostUser,
+        client_endpoint: daemonUrl,
+        agents: agentDefs,
+        agent_statuses: getAgentStatuses(),
+        client_version: CLIENT_VERSION,
+        plugin_hash: fileHash(join(PLUGIN_DIR, "index.js")),
+        daemon_port: parseInt(daemonUrl.split(":").pop()),
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.ok) {
+      const names = [...agents.keys()];
+      log(`✅ 注册成功: [${names.join(", ")}] (${agentDefs[0]?.skills?.length || 0} skills, ${agentDefs[0]?.mcps?.length || 0} mcps)`);
+      for (const [, info] of agents) info.registered = true;
+      lastInventoryFP = inventoryFP(agentDefs[0]?.skills || [], agentDefs[0]?.mcps || []);
+    } else {
+      log(`❌ 注册失败: HTTP ${res.status}`);
+    }
+  } catch (err) {
+    log(`⚠ Server 不可达: ${err.message}`);
+  }
+}
+
+let lastFullRegister = 0;
+const FULL_REGISTER_INTERVAL = 3_000; // 每 3s 强制重新注册（防 Server 重启后状态丢失）
+
+async function heartbeat() {
+  if (agents.size === 0) return;
+
+  // 检查是否有 agent 还没注册成功，或者距离上次完整注册超过 60s
+  const anyUnregistered = [...agents.values()].some(a => !a.registered);
+  const needFullRegister = Date.now() - lastFullRegister > FULL_REGISTER_INTERVAL;
+  if (anyUnregistered || needFullRegister) {
+    await registerToServer();
+    if ([...agents.values()].every(a => a.registered)) lastFullRegister = Date.now();
+    return;
+  }
+
+  try {
+    const body = {
+      user_id: userId,
+      host_user: hostUser,
+      agent_statuses: getAgentStatuses(),
+      client_version: CLIENT_VERSION,
+      plugin_hash: fileHash(join(PLUGIN_DIR, "index.js")),
+      daemon_port: parseInt(daemonUrl.split(":").pop()),
+    };
+
+    // inventory 变化检测
+    const skills = scanSkills();
+    const mcps = scanMcps();
+    const fp = inventoryFP(skills, mcps);
+    if (fp !== lastInventoryFP) {
+      log(`📦 inventory 变化 (${skills.length} skills, ${mcps.length} mcps)`);
+      const inv = {};
+      for (const [name] of agents) inv[name] = { skills, mcps };
+      body.agent_inventory = inv;
+      lastInventoryFP = fp;
+    }
+
+    const res = await fetch(`${META_AGENT_SERVER}/api/clients/heartbeat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!res.ok) {
+      for (const [, info] of agents) info.registered = false;
+    }
+  } catch {
+    for (const [, info] of agents) info.registered = false;
+  }
+}
+
+// ============================================================
+// 任务队列：按 agent_name 路由
+// ============================================================
+function enqueueTask(agentName, task) {
+  const q = getAgentQueue(agentName);
+  if (q.pending.length >= MAX_QUEUE_SIZE) {
+    log(`⚠ ${agentName} 队列已满 (${MAX_QUEUE_SIZE})，拒绝: "${task.title}"`);
+    return false;
+  }
+  q.pending.push(task);
+  log(`📋 ${agentName} 任务入队: "${task.title}" (队列: ${q.pending.length})`);
+
+  // 如果该 agent 有 long-poll 在等待 且 当前没在执行任务，立即唤醒取第一个任务
+  if (q.waitingResponse && !q.executingTaskId) {
+    const waiter = q.waitingResponse;
+    q.waitingResponse = null;
+    const agentInfo = agents.get(agentName);
+    const runtime = agentInfo?.runtime || "opencode";
+    const nextTask = q.pending.shift();
+
+    if (runtime === "claude-code") {
+      // Claude Code 模式：只通知有任务（不取走）
+      q.pending.unshift(nextTask);  // 放回去，CC 自己取
+      try {
+        waiter.writeHead(200, { "Content-Type": "application/json" });
+        waiter.end(JSON.stringify({ task: { id: nextTask.id, title: nextTask.title, _notify: true } }));
+      } catch {}
+    } else {
+      // opencode 模式：直接取走任务给 Plugin 执行
+      q.lastExecuted = nextTask;
+      q.executingTaskId = nextTask.id;  // 分发时立即标记（防竞态）
+      try {
+        waiter.writeHead(200, { "Content-Type": "application/json" });
+        waiter.end(JSON.stringify({ task: nextTask }));
+      } catch {}
+    }
+  }
+  return true;
+}
+
+async function reportTaskResult(task, status, result, durationMs) {
+  // 更新 workflow 跟踪表
+  // Strip ANSI escape codes from result（远端 agent 输出可能带终端颜色码）
+  const cleanResult = (result || "").replace(/\x1b\[[0-9;]*m/g, "");
+
+  if (task.workflow_id && workflowTracker.has(task.workflow_id)) {
+    const entry = workflowTracker.get(task.workflow_id);
+    entry.status = status;
+    entry.completed_at = new Date().toISOString();
+    entry.result = cleanResult.substring(0, 2000);
+  }
+
+  if (task.workflow_id && task.node_id) {
+    try {
+      const url = `${META_AGENT_SERVER}/api/workflows/${task.workflow_id}/nodes/${task.node_id}/result`;
+      log(`📤 回报 workflow: ${url}`);
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          execution_id: task.execution_id || task.id,
+          status,
+          result: cleanResult.substring(0, 5000),
+          duration_ms: durationMs,
+          session_id: task.session_id || "",
+        }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!res.ok) log(`⚠ workflow 回报 HTTP ${res.status}`);
+    } catch (err) { log(`⚠ workflow 回报失败: ${err.message}`); }
+    return;
+  }
+  try {
+    await fetch(`${META_AGENT_SERVER}/api/tasks/${task.id}/result`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status, result: result.substring(0, 5000), duration_ms: durationMs }),
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch (err) { log(`⚠ 回报失败: ${err.message}`); }
+}
+
+// 任务轮询（降级）
+async function pollTasks() {
+  if (agents.size === 0) return;
+  for (const [name] of agents) {
+    const q = getAgentQueue(name);
+    if (q.pending.length > 0) continue;
+    try {
+      const url = `${META_AGENT_SERVER}/api/tasks/poll?agent_name=${encodeURIComponent(name)}&user_id=${encodeURIComponent(userId)}`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (!data.has_task) continue;
+      log(`📥 轮询到任务: "${data.task.title}" → ${name}`);
+      const task = {
+        id: data.task.id,
+        type: data.task.type || "custom",
+        title: data.task.title,
+        description: data.task.description || "",
+        target_agent: name,
+      };
+      enqueueTask(name, task);
+    } catch {}
+  }
+}
+
+// ============================================================
+// OTA
+// ============================================================
+function performOTA(payload) {
+  const { files = [] } = payload;
+  let applied = 0, failed = 0;
+  const errors = [];
+  let daemonUpdated = false;
+
+  for (const f of files) {
+    try {
+      let target = f.path;
+      if (target.startsWith("plugin/")) {
+        const relName = target.slice(7);
+        if (relName === "daemon.mjs") {
+          target = join(dirname(new URL(import.meta.url).pathname), relName);
+        } else {
+          target = join(PLUGIN_DIR, relName);
+        }
+      } else {
+        target = target.replace(/^~/, homedir());
+      }
+      const selfDir = dirname(new URL(import.meta.url).pathname);
+      const allowed = [
+        join(homedir(), ".config", "opencode"),
+        join(homedir(), ".opencode"),
+        join(homedir(), ".claude"),
+        join(homedir(), ".agents"),
+        join(homedir(), ".meta-agent-framework"),
+        selfDir,
+      ];
+      if (!allowed.some(d => target.startsWith(d))) { errors.push(`白名单外: ${target}`); failed++; continue; }
+
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, f.content, "utf-8");
+      if (f.hash && fileHash(target) !== f.hash) { errors.push(`hash 不匹配: ${f.path}`); failed++; continue; }
+      log(`✅ OTA: ${f.path} → ${target}`);
+      applied++;
+      if (f.path === "plugin/daemon.mjs" || target.endsWith("daemon.mjs")) daemonUpdated = true;
+    } catch (err) { errors.push(`${f.path}: ${err.message}`); failed++; }
+  }
+  return { applied, failed, restarted: daemonUpdated ? 1 : 0, daemon_updated: daemonUpdated, errors };
+}
+
+// ============================================================
+// Evolve — 进化指令执行（push_files / run_command）
+// ============================================================
+
+/**
+ * 根据 target 和 runtime 解析实际写入目录
+ *
+ * Server 只声明逻辑目标（skill / agent / mcp_config），
+ * Daemon 根据 runtime 映射到正确的物理路径。
+ */
+function resolveEvolveTargetDir(target, runtime, action) {
+  const home = homedir();
+  switch (target) {
+    case "skill":
+      return runtime === "claude-code"
+        ? join(home, ".claude", "skills")
+        : join(home, ".config", "opencode", "skills");
+    case "agent":
+      return runtime === "claude-code"
+        ? join(home, ".claude", "agents")
+        : join(home, ".config", "opencode", "agents");
+    case "project_agent": {
+      const projPath = action.project_path || DIRECTORY;
+      return runtime === "claude-code"
+        ? join(projPath, ".claude")
+        : join(projPath, ".opencode", "agents");
+    }
+    case "mcp_config": {
+      const projPath = action.project_path || DIRECTORY;
+      return runtime === "claude-code"
+        ? projPath  // claude: .mcp.json 在项目根目录
+        : projPath; // opencode: opencode.json 在项目根目录
+    }
+    case "global_rules":
+      return runtime === "claude-code"
+        ? join(home, ".claude")
+        : join(home, ".config", "opencode");
+    case "custom":
+      return (action.target_path || "").replace(/^~/, home);
+    default:
+      return "";
+  }
+}
+
+/** Evolve 写入白名单（与 OTA 一致 + 项目目录） */
+function isEvolvePathAllowed(target) {
+  const home = homedir();
+  const allowed = [
+    join(home, ".config", "opencode"),
+    join(home, ".opencode"),
+    join(home, ".claude"),
+    join(home, ".agents"),
+    join(home, ".meta-agent-framework"),
+  ];
+  // 项目目录下的 .opencode/ .claude/ 也允许
+  if (target.includes("/.opencode/") || target.includes("/.claude/")) return true;
+  // 项目根目录的配置文件（opencode.json / .mcp.json）
+  if (target.endsWith("/opencode.json") || target.endsWith("/.mcp.json")) return true;
+  return allowed.some(d => target.startsWith(d));
+}
+
+/**
+ * 校验 SKILL.md 的 YAML frontmatter（opencode 要求 name + description 才能被 /skills 发现）
+ *
+ * 规则（参考 https://opencode.ai/docs/skills/）：
+ *   1. 必须以 "---\n" 开头
+ *   2. 必须包含 name: 全小写字母数字+连字符，匹配 ^[a-z0-9]+(-[a-z0-9]+)*$
+ *   3. 必须包含 description: 1-1024 字符
+ */
+function validateSkillFrontmatter(content, relativePath) {
+  if (typeof content !== "string") return null;  // binary，不校验
+  if (!content.startsWith("---\n") && !content.startsWith("---\r\n")) {
+    return `SKILL.md 缺少 YAML frontmatter（必须以 --- 开头）: ${relativePath}`;
+  }
+  const endIdx = content.indexOf("\n---", 3);
+  if (endIdx === -1) {
+    return `SKILL.md frontmatter 未闭合（缺少结束 ---）: ${relativePath}`;
+  }
+  const fm = content.slice(4, endIdx);
+  const nameMatch = fm.match(/^name:\s*(.+)$/m);
+  if (!nameMatch) {
+    return `SKILL.md frontmatter 缺少 name 字段: ${relativePath}`;
+  }
+  const name = nameMatch[1].trim();
+  if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(name)) {
+    return `SKILL.md name 格式非法（需全小写+连字符）: "${name}" in ${relativePath}`;
+  }
+  const descMatch = fm.match(/^description:\s*(.+)$/m);
+  if (!descMatch || descMatch[1].trim().length === 0) {
+    return `SKILL.md frontmatter 缺少 description 字段: ${relativePath}`;
+  }
+  if (descMatch[1].trim().length > 1024) {
+    return `SKILL.md description 超过 1024 字符: ${relativePath}`;
+  }
+  return null;  // 校验通过
+}
+
+/** 执行 push_files 动作 */
+function executeEvolvePushFiles(action, runtime) {
+  const files = action.files || [];
+  const target = action.target || "custom";
+  const baseDir = resolveEvolveTargetDir(target, runtime, action);
+
+  if (!baseDir) {
+    return { type: "push_files", status: "failed", message: `无法解析目标目录: target=${target}` };
+  }
+
+  let written = 0;
+  const errors = [];
+
+  for (const f of files) {
+    try {
+      const fullPath = join(baseDir, f.relative_path);
+      if (!isEvolvePathAllowed(fullPath)) {
+        errors.push(`白名单外: ${fullPath}`);
+        continue;
+      }
+      const content = f.encoding === "base64" ? Buffer.from(f.content, "base64") : f.content;
+
+      // skill 推送时校验 SKILL.md 的 YAML frontmatter（仅警告，不阻止写入）
+      if (target === "skill" && f.relative_path.endsWith("/SKILL.md")) {
+        const fmError = validateSkillFrontmatter(content, f.relative_path);
+        if (fmError) {
+          log(`  ⚠️ ${fmError}（opencode /skills 可能不显示）`);
+        }
+      }
+
+      mkdirSync(dirname(fullPath), { recursive: true });
+      writeFileSync(fullPath, content, f.encoding === "base64" ? undefined : "utf-8");
+      log(`  ✅ Evolve push: ${f.relative_path} → ${fullPath}`);
+      written++;
+    } catch (err) {
+      errors.push(`${f.relative_path}: ${err.message}`);
+    }
+  }
+
+  if (errors.length > 0 && written === 0) {
+    return { type: "push_files", status: "failed", message: errors.join("; ") };
+  }
+  return {
+    type: "push_files", status: "ok",
+    message: `${written}/${files.length} files written${errors.length > 0 ? `, errors: ${errors.join("; ")}` : ""}`,
+  };
+}
+
+/** 执行 run_command 动作 */
+function executeEvolveRunCommand(action) {
+  const cmd = action.command;
+  if (!cmd) return { type: "run_command", status: "failed", message: "no command specified" };
+
+  const cwd = (action.cwd || DIRECTORY).replace(/^~/, homedir());
+  const timeout = action.timeout_ms || 60_000;
+
+  try {
+    const output = execSync(cmd, {
+      cwd,
+      timeout,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+      maxBuffer: 1024 * 1024,
+    });
+    log(`  ✅ Evolve cmd: ${cmd} (cwd=${cwd})`);
+    return { type: "run_command", status: "ok", message: (output || "").substring(0, 500) };
+  } catch (err) {
+    return { type: "run_command", status: "failed", message: err.message.substring(0, 500) };
+  }
+}
+
+// ============================================================
+// HTTP Server
+// ============================================================
+const httpServer = createServer(async (req, res) => {
+  const readBody = () => new Promise(r => {
+    let d = ""; req.on("data", c => d += c); req.on("end", () => { try { r(JSON.parse(d)); } catch { r({}); } });
+  });
+  const json = (code, obj) => { res.writeHead(code, { "Content-Type": "application/json" }); res.end(JSON.stringify(obj)); };
+  const urlObj = new URL(req.url, "http://localhost");
+  const pathname = urlObj.pathname;
+
+  // GET /health
+  if (req.method === "GET" && pathname === "/health") {
+    json(200, {
+      ok: true,
+      pid: process.pid,
+      agents: [...agents.keys()],
+      daemon_hash: DAEMON_SELF_HASH,
+      uptime: process.uptime(),
+      version: CLIENT_VERSION,
+      server: META_AGENT_SERVER,
+    });
+    return;
+  }
+
+  // POST /agents/connect — Plugin/Hook 连接：注册一个 agent
+  if (req.method === "POST" && pathname === "/agents/connect") {
+    const body = await readBody();
+    const name = body.agent_name;
+    if (!name) { json(400, { error: "agent_name required" }); return; }
+
+    const existing = agents.get(name);
+    const info = {
+      runtime: body.runtime || existing?.runtime || "opencode",
+      pluginPid: body.plugin_pid || existing?.pluginPid || 0,
+      directory: body.directory || existing?.directory || DIRECTORY,
+      registered: false,
+      sessionId: body.session_id || existing?.sessionId || "",
+      lastSeen: Date.now(),
+    };
+    agents.set(name, info);
+
+    if (body.user_id) userId = body.user_id;
+    if (body.host_user) hostUser = body.host_user;
+
+    log(`🔗 agent 连接: ${name} (runtime=${info.runtime}, agents=[${[...agents.keys()].join(", ")}])`);
+
+    // 触发注册
+    await registerToServer();
+    json(200, { ok: true, agents: [...agents.keys()] });
+    return;
+  }
+
+  // POST /agents/disconnect — Plugin/Hook 断开：注销一个 agent
+  if (req.method === "POST" && pathname === "/agents/disconnect") {
+    const body = await readBody();
+    const name = body.agent_name;
+    if (name && agents.has(name)) {
+      // 防竞态：如果 disconnect 的 PID 和当前 agent 的 pluginPid 不同，说明是旧 Plugin 发的
+      const info = agents.get(name);
+      const reqPid = body.plugin_pid || 0;
+      if (reqPid > 0 && info.pluginPid > 0 && reqPid !== info.pluginPid) {
+        log(`⚠ disconnect ${name} 被忽略（pid ${reqPid} ≠ 当前 ${info.pluginPid}）`);
+        json(200, { ok: true, ignored: true, agents: [...agents.keys()] });
+        return;
+      }
+      agents.delete(name);
+      // 清理任务队列
+      const q = taskQueues.get(name);
+      if (q?.waitingResponse) {
+        try { q.waitingResponse.writeHead(200, { "Content-Type": "application/json" }); q.waitingResponse.end('{"task":null}'); } catch {}
+      }
+      taskQueues.delete(name);
+      log(`🔌 agent 断开: ${name} (剩余=[${[...agents.keys()].join(", ")}])`);
+    }
+    json(200, { ok: true, agents: [...agents.keys()] });
+    return;
+  }
+
+  // GET /agents — 列出当前管理的所有 agent
+  if (req.method === "GET" && pathname === "/agents") {
+    const list = [];
+    for (const [name, info] of agents) {
+      list.push({ agent_name: name, ...info });
+    }
+    json(200, { agents: list });
+    return;
+  }
+
+  // GET /workflows/pending — 查询正在执行中的 workflow 任务
+  if (req.method === "GET" && pathname === "/workflows/pending") {
+    const pending = [];
+    for (const [wfId, entry] of workflowTracker) {
+      if (entry.status === "pending") {
+        pending.push({ workflow_id: wfId, ...entry });
+      }
+    }
+    json(200, pending);
+    return;
+  }
+
+  // GET /workflows/completed — 查询已完成的 workflow 任务
+  // 参数：?limit=N（默认10）、?since=ISO时间戳
+  if (req.method === "GET" && pathname === "/workflows/completed") {
+    const since = urlObj.searchParams.get("since") || "";
+    const limit = parseInt(urlObj.searchParams.get("limit") || "10") || 10;
+    const sinceTs = since ? new Date(since).getTime() : 0;
+    const completed = [];
+    for (const [wfId, entry] of workflowTracker) {
+      if (entry.status === "completed" || entry.status === "failed") {
+        if (!sinceTs || (entry.completed_at && new Date(entry.completed_at).getTime() > sinceTs)) {
+          completed.push({ workflow_id: wfId, ...entry });
+        }
+      }
+    }
+    // 按完成时间倒序，取最近 limit 条
+    completed.sort((a, b) => (b.completed_at || "").localeCompare(a.completed_at || ""));
+    json(200, completed.slice(0, limit));
+    return;
+  }
+
+  // === 兼容旧接口 ===
+
+  // POST /agent — 兼容旧版 Plugin 通知 agent 切换 → 转发到 /agents/connect
+  if (req.method === "POST" && pathname === "/agent") {
+    const body = await readBody();
+    if (body.agent_name) {
+      const info = {
+        runtime: body.runtime || "opencode",
+        pluginPid: 0,
+        directory: DIRECTORY,
+        registered: false,
+        sessionId: "",
+        lastSeen: Date.now(),
+      };
+      agents.set(body.agent_name, info);
+      if (body.user_id) userId = body.user_id;
+      if (body.host_user) hostUser = body.host_user;
+      log(`🔗 agent 连接(兼容): ${body.agent_name}`);
+      await registerToServer();
+    }
+    json(200, { ok: true });
+    return;
+  }
+
+  // POST /session — Plugin 通知 session 更新
+  if (req.method === "POST" && pathname === "/session") {
+    const body = await readBody();
+    if (body.agent_name && agents.has(body.agent_name)) {
+      agents.get(body.agent_name).sessionId = body.session_id || "";
+    }
+    json(200, { ok: true });
+    return;
+  }
+
+  // POST /execute — Server 推送任务 → 按 agent_name 路由入队（无 Plugin 时自动拉起 serve）
+  if (req.method === "POST" && pathname === "/execute") {
+    const body = await readBody();
+    const targetAgent = body.target_agent || body.agent_name;
+    const projectPath = body.project_path || "";
+    const runtime = body.runtime || "opencode";
+    log(`📥 收到任务: "${body.title || body.prompt}" → ${targetAgent}${body.workflow_id ? ` (workflow=${body.workflow_id})` : ""}`);
+
+    if (!targetAgent) {
+      json(400, { error: "agent_name required" });
+      return;
+    }
+
+    const task = {
+      id: body.task_id || body.execution_id || `push-${Date.now()}`,
+      type: body.type || body.intent || "custom",
+      title: body.title || body.prompt?.substring(0, 80) || "任务",
+      description: body.description || body.prompt || "",
+      target_agent: targetAgent,
+      workflow_id: body.workflow_id || "",
+      node_id: body.node_id || "",
+      execution_id: body.execution_id || "",
+    };
+
+    // 记录到 workflow 跟踪表
+    if (task.workflow_id) {
+      workflowTracker.set(task.workflow_id, {
+        title: task.title,
+        agent_name: targetAgent,
+        node_id: task.node_id,
+        status: "pending",
+        dispatched_at: new Date().toISOString(),
+        completed_at: null,
+        result: null,
+      });
+    }
+
+    // 检查是否有 Plugin 在线（long-poll 存活 或 进程存活）
+    const q = getAgentQueue(targetAgent);
+    const agentInfo = agents.get(targetAgent);
+    const hasPlugin = q.waitingResponse
+      || (agentInfo && agentInfo.lastSeen && Date.now() - agentInfo.lastSeen < AGENT_ALIVE_TIMEOUT)
+      || (agentInfo && isProcessAlive(agentInfo.pluginPid));
+
+    if (hasPlugin) {
+      // 有 Plugin 在线，正常入队
+      const ok = enqueueTask(targetAgent, task);
+      if (ok) {
+        json(202, { accepted: true, agent: targetAgent, mode: "plugin-bridge" });
+      } else {
+        json(409, { error: "queue full" });
+      }
+    } else {
+      // 无 Plugin 在线 → 按需拉起（opencode: screen TUI, claude-code: screen TUI + hooks）
+      log(`🔄 ${targetAgent} 无 Plugin 在线，按需拉起 (runtime=${runtime})...`);
+
+      // 先入队（拉起后 Plugin/Wait 会取走）
+      enqueueTask(targetAgent, task);
+      json(202, { accepted: true, agent: targetAgent, mode: "auto-launch" });
+
+      // 异步拉起（不阻塞 HTTP 响应）
+      const agentDir = projectPath || agents.get(targetAgent)?.directory || DIRECTORY;
+      spawnAgent(targetAgent, agentDir, runtime).then(ok => {
+        if (ok) {
+          const info = serveProcesses.get(targetAgent);
+          if (info) info.lastTaskAt = Date.now();
+        }
+      }).catch(err => {
+        log(`❌ 按需拉起失败: ${targetAgent} ${err.message}`);
+      });
+    }
+    return;
+  }
+
+  // GET /tasks/pending — 查看待执行任务
+  if (req.method === "GET" && pathname === "/tasks/pending") {
+    const agent = urlObj.searchParams.get("agent");
+    if (agent) {
+      const q = taskQueues.get(agent);
+      json(200, { task: q?.pending || null });
+    } else {
+      // 兼容旧版：返回任意一个 pending task
+      let found = null;
+      for (const [, q] of taskQueues) { if (q.pending.length > 0) { found = q.pending[0]; break; } }
+      json(200, { task: found });
+    }
+    return;
+  }
+
+  // GET|POST /tasks/take — 取走任务（Claude Code: wait 通知后 take 取走）
+  if ((req.method === "GET" || req.method === "POST") && pathname === "/tasks/take") {
+    const agent = urlObj.searchParams.get("agent");
+    // 按 agent 取
+    if (agent) {
+      const q = taskQueues.get(agent);
+      if (q?.pending.length > 0) {
+        const task = q.pending.shift();
+        q.lastExecuted = task;
+        json(200, { task });
+      } else {
+        json(200, { task: null });
+      }
+    } else {
+      // 兼容旧版：取任意一个
+      let found = null;
+      for (const [, q] of taskQueues) {
+        if (q.pending.length > 0) {
+          found = q.pending.shift();
+          q.lastExecuted = found;
+          break;
+        }
+      }
+      json(200, { task: found });
+    }
+    return;
+  }
+
+  // GET /tasks/wait — long-poll 等待任务通知（按 agent 隔离）
+  // 每次 long-poll 请求本身就是 agent 存活心跳
+  // Plugin 解耦后：执行期间 long-poll 继续运行，但不分发新任务
+  if (req.method === "GET" && pathname === "/tasks/wait") {
+    const agent = urlObj.searchParams.get("agent");
+    // 确定目标 agent
+    let targetAgent = agent;
+    if (!targetAgent) {
+      // 兼容旧版：如果只有一个 agent，用那个
+      if (agents.size === 1) targetAgent = [...agents.keys()][0];
+    }
+
+    if (!targetAgent) {
+      json(400, { error: "agent param required" });
+      return;
+    }
+
+    // long-poll 请求 = agent 存活信号
+    touchAgent(targetAgent);
+
+    const q = getAgentQueue(targetAgent);
+    const agentInfo = agents.get(targetAgent);
+    const runtime = agentInfo?.runtime || "opencode";
+
+    // 正在执行任务时不分发新任务（留在 pending 等执行完）
+    if (q.executingTaskId) {
+      // 仍然挂起 long-poll（保持连接心跳），但不取 pending
+      if (q.waitingResponse) {
+        try { q.waitingResponse.writeHead(200, { "Content-Type": "application/json" }); q.waitingResponse.end('{"task":null}'); } catch {}
+      }
+      q.waitingResponse = res;
+      setTimeout(() => {
+        if (q.waitingResponse === res) {
+          q.waitingResponse = null;
+          try { res.writeHead(200, { "Content-Type": "application/json" }); res.end('{"task":null}'); } catch {}
+        }
+      }, 2_000);
+      return;
+    }
+
+    if (q.pending.length > 0) {
+      if (runtime === "claude-code") {
+        json(200, { task: { id: q.pending[0].id, title: q.pending[0].title, _notify: true } });
+      } else {
+        const task = q.pending.shift();
+        q.lastExecuted = task;
+        // 分发时立即标记 executing（不等 Plugin 的 /tasks/executing 通知，防止竞态重复分发）
+        q.executingTaskId = task.id;
+        json(200, { task });
+      }
+    } else {
+      // long-poll：挂起连接
+      if (q.waitingResponse) {
+        try { q.waitingResponse.writeHead(200, { "Content-Type": "application/json" }); q.waitingResponse.end('{"task":null}'); } catch {}
+      }
+      q.waitingResponse = res;
+      setTimeout(() => {
+        if (q.waitingResponse === res) {
+          q.waitingResponse = null;
+          try { res.writeHead(200, { "Content-Type": "application/json" }); res.end('{"task":null}'); } catch {}
+        }
+      }, 2_000);
+    }
+    return;
+  }
+
+  // POST /tasks/executing — Plugin 通知开始执行任务（状态 → busy）
+  if (req.method === "POST" && pathname === "/tasks/executing") {
+    const body = await readBody();
+    const agentName = body.agent_name;
+    const taskId = body.task_id;
+    if (agentName) {
+      const q = getAgentQueue(agentName);
+      q.executingTaskId = taskId || "unknown";
+      touchAgent(agentName);
+      log(`🔧 ${agentName} 开始执行任务: ${taskId}`);
+    }
+    json(200, { ok: true });
+    return;
+  }
+
+  // POST /tasks/done — Plugin 回报任务执行结果
+  if (req.method === "POST" && pathname === "/tasks/done") {
+    const body = await readBody();
+    const agentName = body.agent_name;
+    log(`📬 Plugin 回报: task=${body.task_id} status=${body.status} (${body.duration_ms}ms)`);
+
+    // 清除 executing 标记
+    if (agentName && taskQueues.has(agentName)) {
+      taskQueues.get(agentName).executingTaskId = null;
+    }
+
+    // 找到对应的 lastExecuted task
+    let task = null;
+    if (agentName && taskQueues.has(agentName)) {
+      task = taskQueues.get(agentName).lastExecuted;
+      taskQueues.get(agentName).lastExecuted = null;
+    }
+    if (!task) {
+      // 兼容：遍历所有队列找 lastExecuted
+      for (const [, q] of taskQueues) {
+        if (q.lastExecuted) { task = q.lastExecuted; q.lastExecuted = null; break; }
+      }
+    }
+    if (!task) task = { id: body.task_id };
+
+    reportTaskResult(task, body.status, body.result || "", body.duration_ms || 0);
+    json(200, { ok: true });
+    return;
+  }
+
+  // POST /proposals/submit — Agent 提交提议（转发到 Server）
+  if (req.method === "POST" && pathname === "/proposals/submit") {
+    const body = await readBody();
+    if (!body.from_agent || !body.title || !body.type) {
+      json(400, { error: "from_agent, type, and title required" });
+      return;
+    }
+    // 附上 user_id
+    body.user_id = body.user_id || userId;
+    try {
+      const srvRes = await fetch(`${META_AGENT_SERVER}/api/proposals`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(10000),
+      });
+      const data = await srvRes.json();
+      log(`📨 proposal 转发: "${body.title}" → Server (${srvRes.status})`);
+      json(srvRes.status, data);
+    } catch (err) {
+      log(`⚠ proposal 转发失败: ${err.message}`);
+      json(502, { error: `Server 不可达: ${err.message}` });
+    }
+    return;
+  }
+
+  // GET /proposals — 查询提议（从 Server 拉取）
+  if (req.method === "GET" && pathname === "/proposals") {
+    const qs = urlObj.search || "";
+    try {
+      const srvRes = await fetch(`${META_AGENT_SERVER}/api/proposals${qs}`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      const data = await srvRes.json();
+      json(srvRes.status, data);
+    } catch (err) {
+      json(502, { error: `Server 不可达: ${err.message}` });
+    }
+    return;
+  }
+
+  // POST /ping — Server 广播重连
+  if (req.method === "POST" && pathname === "/ping") {
+    log("📡 收到 ping，重新注册");
+    for (const [, info] of agents) info.registered = false;
+    registerToServer();
+    json(200, { ok: true, agents: [...agents.keys()] });
+    return;
+  }
+
+  // GET /status
+  if (req.method === "GET" && pathname === "/status") {
+    json(200, {
+      agents: [...agents.keys()],
+      user_id: userId,
+      directory: DIRECTORY,
+      pid: process.pid,
+      version: CLIENT_VERSION,
+    });
+    return;
+  }
+
+  // POST /ota
+  if (req.method === "POST" && pathname === "/ota") {
+    const body = await readBody();
+    log(`📦 OTA: ${(body.files || []).length} 个文件`);
+    const result = performOTA(body);
+    log(`📦 OTA 结果: applied=${result.applied} failed=${result.failed} daemon_updated=${result.daemon_updated}`);
+    json(200, result);
+    if (result.daemon_updated) {
+      log("🔄 daemon.mjs 已更新，1 秒后自重启...");
+      setTimeout(() => process.exit(0), 1000);
+    }
+    return;
+  }
+
+  // POST /evolve — Server 推送进化指令（skill/agent-config/mcp 文件推送 + 命令执行）
+  if (req.method === "POST" && pathname === "/evolve") {
+    const body = await readBody();
+    const evolveId = body.evolve_id || "unknown";
+    const actions = body.actions || [];
+    const runtime = body.target_runtime || "opencode";
+    log(`🧬 Evolve: "${body.title}" (${evolveId}), ${actions.length} actions, runtime=${runtime}`);
+
+    const start = Date.now();
+    const results = [];
+
+    for (const action of actions) {
+      try {
+        if (action.type === "push_files") {
+          const r = executeEvolvePushFiles(action, runtime);
+          results.push(r);
+          if (r.status === "failed") break; // 前一个失败则后续跳过
+        } else if (action.type === "run_command") {
+          const r = executeEvolveRunCommand(action);
+          results.push(r);
+          if (r.status === "failed") break;
+        } else if (action.type === "restart_agent") {
+          results.push({ type: "restart_agent", status: "ok", message: "restart not yet implemented" });
+        } else if (action.type === "reload_config") {
+          results.push({ type: "reload_config", status: "ok", message: "reload not yet implemented" });
+        } else {
+          results.push({ type: action.type, status: "failed", message: `unknown action type: ${action.type}` });
+        }
+      } catch (err) {
+        results.push({ type: action.type, status: "failed", message: err.message });
+        break;
+      }
+    }
+
+    const allOk = results.every(r => r.status === "ok");
+    const evolveResult = {
+      evolve_id: evolveId,
+      status: allOk ? "completed" : (results.some(r => r.status === "ok") ? "partial" : "failed"),
+      actions: results,
+      duration_ms: Date.now() - start,
+    };
+
+    log(`🧬 Evolve 结果: ${evolveResult.status} (${evolveResult.duration_ms}ms)`);
+    json(200, { accepted: true, result: evolveResult });
+
+    // 异步回报结果到 Server
+    if (META_AGENT_SERVER) {
+      fetch(`${META_AGENT_SERVER}/api/evolve/${evolveId}/result`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(evolveResult),
+        signal: AbortSignal.timeout(10_000),
+      }).catch(err => log(`⚠ Evolve 回报失败: ${err.message}`));
+    }
+    return;
+  }
+
+  // POST /shutdown — 兼容旧版：清理指定 agent，Node Daemon 常驻不退出
+  if (req.method === "POST" && pathname === "/shutdown") {
+    const body = await readBody();
+    const agent = body.agent_name;
+    if (agent && agents.has(agent)) {
+      agents.delete(agent);
+      const q = taskQueues.get(agent);
+      if (q?.waitingResponse) {
+        try { q.waitingResponse.writeHead(200, { "Content-Type": "application/json" }); q.waitingResponse.end('{"task":null}'); } catch {}
+      }
+      taskQueues.delete(agent);
+      log(`📴 shutdown: 清理 agent ${agent} (剩余=[${[...agents.keys()].join(", ")}])`);
+    }
+    // Node Daemon 常驻——即使没有 agent 也不退出，等待新连接或 Server 推任务
+    json(200, { ok: true, agents: [...agents.keys()] });
+    return;
+  }
+
+  json(404, { error: "not found" });
+});
+
+// ============================================================
+// 启动
+// ============================================================
+httpServer.listen(NODE_PORT, "0.0.0.0", () => {
+  const addr = httpServer.address();
+  const port = addr.port;
+  daemonUrl = `http://${getLocalIP()}:${port}`;
+
+  // 通过 stdout 告诉 Plugin 实际端口，然后关闭 stdout/stderr 防 EPIPE
+  try { process.stdout.write(`PORT:${port}\n`); } catch {}
+  try { process.stdout.end(); } catch {}
+  try { process.stderr.end(); } catch {}
+
+  // 写端口文件（统一一个文件，不再按 agent 分文件）
+  try { writeFileSync(join(STATE_DIR, "daemon-port"), String(port)); } catch {}
+
+  log(`Node Daemon 启动: pid=${process.pid} port=${port}`);
+  log(`  对外地址: ${daemonUrl}`);
+  log(`  Plugin 目录: ${PLUGIN_DIR}`);
+
+  // 初始化用户标识
+  if (!userId) userId = detectUserId();
+
+  // 如果有初始 agent（Claude Code --daemon 模式传入），立即注册
+  const initAgent = process.env.MAF_AGENT_NAME;
+  const initRuntime = process.env.MAF_RUNTIME || "opencode";
+  if (initAgent) {
+    agents.set(initAgent, {
+      runtime: initRuntime,
+      pluginPid: 0,
+      directory: DIRECTORY,
+      registered: false,
+      sessionId: "",
+      lastSeen: Date.now(),
+    });
+    log(`  初始 agent: ${initAgent} (runtime=${initRuntime})`);
+    registerToServer();
+  }
+
+  // 启动心跳 + 任务轮询 + agent 存活清理 + serve 空闲清理
+  setInterval(heartbeat, HEARTBEAT_INTERVAL);
+  setInterval(pollTasks, POLL_INTERVAL);
+  setInterval(cleanDeadAgents, 60_000);
+  setInterval(cleanIdleServes, 60_000);
+});
+
+httpServer.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    // 端口已被占用——说明已有 Node Daemon 在运行
+    log(`端口 ${NODE_PORT} 已被占用，Node Daemon 可能已在运行`);
+    // 通过 stdout 通知调用方已有实例
+    try { process.stdout.write(`PORT:${NODE_PORT}\n`); } catch {}
+    process.exit(0);
+  }
+  log(`HTTP error: ${err.message}`);
+  process.exit(1);
+});
+
+process.on("SIGINT", () => { cleanAllServes(); process.exit(0); });
+process.on("SIGTERM", () => { cleanAllServes(); process.exit(0); });
+process.on("uncaughtException", (err) => {
+  // 只写文件，绝不写 stdout/stderr（防 EPIPE 死循环）
+  try { appendFileSync(LOG_FILE, `${new Date().toISOString().slice(11, 23)} [node-daemon] 异常: ${err.message}\n`); } catch {}
+});

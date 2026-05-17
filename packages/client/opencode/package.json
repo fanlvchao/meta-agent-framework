@@ -1,0 +1,19 @@
+{
+  "name": "opencode-plugin-meta-agent-framework",
+  "version": "0.4.6",
+  "description": "Meta-Agent-Framework Bridge — 让 opencode 自动接入分布式 Agent 网络",
+  "type": "module",
+  "main": "index.js",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "agent",
+    "distributed",
+    "meta-agent-framework"
+  ],
+  "author": "Meta-Agent-Framework",
+  "license": "MIT",
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.0.0"
+  }
+}

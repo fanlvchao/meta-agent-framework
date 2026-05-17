@@ -1,0 +1,227 @@
+<mxfile>
+  <diagram name="MAF v0.4.0 交互拓扑" id="topology">
+    <mxGraphModel dx="1400" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" pageScale="1" pageWidth="1800" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- ========== Server 端 ========== -->
+        <mxCell id="server-bg" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;opacity=30;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="500" height="520" as="geometry"/>
+        </mxCell>
+        <mxCell id="server-title" value="&lt;b&gt;Server 端&lt;/b&gt;（任意机器）" style="text;html=1;fontSize=16;align=left;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="60" y="55" width="250" height="30" as="geometry"/>
+        </mxCell>
+
+        <!-- Server 进程 -->
+        <mxCell id="server" value="&lt;b&gt;MAF Server&lt;/b&gt;&lt;br&gt;(Express + SQLite)&lt;br&gt;maf-server start" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="80" y="100" width="200" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Server 组件 -->
+        <mxCell id="workflow" value="WorkflowEngine&lt;br&gt;(DAG 编排)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="80" y="190" width="140" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="registry" value="Agent Registry&lt;br&gt;+ HealthMonitor" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="80" y="250" width="140" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="registry-svc" value="ExternalRegistry&lt;br&gt;(可插拔接口)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="80" y="310" width="140" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="proposal-svc" value="Proposal Service&lt;br&gt;(逆向提议通道)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="80" y="370" width="140" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="ota-svc" value="OTA 推送&lt;br&gt;(版本检测+自动更新)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="80" y="430" width="140" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="sse" value="SSE Event Bus&lt;br&gt;+ Dashboard" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="80" y="490" width="140" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Server Agent (opencode TUI) -->
+        <mxCell id="server-agent-bg" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;strokeWidth=1;opacity=40;" vertex="1" parent="1">
+          <mxGeometry x="300" y="180" width="210" height="140" as="geometry"/>
+        </mxCell>
+        <mxCell id="server-agent-title" value="&lt;b&gt;opencode TUI (Server 机器)&lt;/b&gt;" style="text;html=1;fontSize=11;align=center;" vertex="1" parent="1">
+          <mxGeometry x="310" y="188" width="190" height="20" as="geometry"/>
+        </mxCell>
+        <mxCell id="server-agent" value="Meta-Agent-Server&lt;br&gt;(primary agent)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="320" y="215" width="170" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="server-plugin" value="MAF Plugin&lt;br&gt;(→ Node Daemon)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="268" width="170" height="35" as="geometry"/>
+        </mxCell>
+
+        <!-- Server → workflow -->
+        <mxCell id="s-w" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#6c8ebf;" edge="1" source="server" target="workflow" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Server Agent → Server API -->
+        <mxCell id="sa-s" value="curl API" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#9673a6;fontSize=10;fontColor=#9673a6;" edge="1" source="server-agent" target="workflow" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- ========== Client 端（远程机器）========== -->
+        <mxCell id="client-bg" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;opacity=30;" vertex="1" parent="1">
+          <mxGeometry x="640" y="40" width="560" height="640" as="geometry"/>
+        </mxCell>
+        <mxCell id="client-title" value="&lt;b&gt;Client 端&lt;/b&gt;（远程机器，一台一个 Daemon）" style="text;html=1;fontSize=16;align=left;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="660" y="55" width="400" height="30" as="geometry"/>
+        </mxCell>
+
+        <!-- ===== Node Daemon (核心) ===== -->
+        <mxCell id="daemon" value="&lt;b&gt;Node Daemon (daemon.mjs)&lt;/b&gt;&lt;br&gt;固定端口 4100 · 一台机器一个&lt;br&gt;agents Map · taskQueues Map&lt;br&gt;注册/心跳 → Server · OTA 接收&lt;br&gt;按需拉起 screen + TUI" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=left;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="670" y="100" width="260" height="95" as="geometry"/>
+        </mxCell>
+
+        <!-- 按需拉起标注 -->
+        <mxCell id="screen-note" value="screen -S maf-{name}&lt;br&gt;自动拉起 opencode TUI" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#66BB6A;fontSize=10;align=left;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="960" y="110" width="210" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="daemon-screen" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#66BB6A;dashed=1;fontSize=9;" edge="1" source="daemon" target="screen-note" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- ===== opencode Agent (TUI A) ===== -->
+        <mxCell id="oc-tui-bg" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;strokeWidth=1;opacity=40;" vertex="1" parent="1">
+          <mxGeometry x="670" y="230" width="500" height="140" as="geometry"/>
+        </mxCell>
+        <mxCell id="oc-tui-title" value="&lt;b&gt;opencode TUI&lt;/b&gt; (Agent A: a2b-booster)" style="text;html=1;fontSize=11;align=left;" vertex="1" parent="1">
+          <mxGeometry x="685" y="238" width="350" height="20" as="geometry"/>
+        </mxCell>
+        <mxCell id="oc-plugin" value="&lt;b&gt;MAF Plugin (index.js)&lt;/b&gt;&lt;br&gt;POST /agents/connect 注册&lt;br&gt;long-poll /tasks/wait?agent=xxx&lt;br&gt;fetch POST /session/message 驱动执行&lt;br&gt;session.idle 收集结果 → 回报" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;align=left;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="690" y="265" width="230" height="85" as="geometry"/>
+        </mxCell>
+        <mxCell id="oc-agent" value="&lt;b&gt;业务 Agent&lt;/b&gt;&lt;br&gt;(用户 .md 定义)&lt;br&gt;permission.ask&lt;br&gt;自动批准" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="950" y="270" width="190" height="75" as="geometry"/>
+        </mxCell>
+
+        <!-- Plugin → Agent -->
+        <mxCell id="p-a-oc" value="HTTP API" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#9673a6;fontSize=9;fontColor=#9673a6;" edge="1" source="oc-plugin" target="oc-agent" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Daemon ↔ Plugin (opencode) -->
+        <mxCell id="d-p-oc" value="long-poll&lt;br&gt;/tasks/wait?agent=A" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#82b366;fontSize=9;fontColor=#82b366;" edge="1" source="daemon" target="oc-plugin" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- ===== Claude Code Agent (TUI B) ===== -->
+        <mxCell id="cc-tui-bg" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=1;opacity=40;" vertex="1" parent="1">
+          <mxGeometry x="670" y="405" width="500" height="140" as="geometry"/>
+        </mxCell>
+        <mxCell id="cc-tui-title" value="&lt;b&gt;Claude Code TUI&lt;/b&gt; (Agent B: code-reviewer)" style="text;html=1;fontSize=11;align=left;" vertex="1" parent="1">
+          <mxGeometry x="685" y="413" width="350" height="20" as="geometry"/>
+        </mxCell>
+        <mxCell id="cc-plugin" value="&lt;b&gt;maf-agent.mjs&lt;/b&gt;&lt;br&gt;--daemon: 连接/拉起 Daemon + 注册&lt;br&gt;--wait: long-poll /tasks/wait?agent=B&lt;br&gt;exit 2 唤醒 Claude → 执行&lt;br&gt;curl 回报结果到 Daemon" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="690" y="440" width="230" height="85" as="geometry"/>
+        </mxCell>
+        <mxCell id="cc-agent" value="&lt;b&gt;业务 Agent&lt;/b&gt;&lt;br&gt;(用户 .md 定义)&lt;br&gt;.claude/agents/*.md" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="950" y="445" width="190" height="75" as="geometry"/>
+        </mxCell>
+
+        <!-- Plugin → Agent (Claude Code) -->
+        <mxCell id="p-a-cc" value="exit 2 唤醒" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#d6b656;fontSize=9;fontColor=#d6b656;" edge="1" source="cc-plugin" target="cc-agent" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Daemon ↔ Plugin (Claude Code) -->
+        <mxCell id="d-p-cc" value="long-poll&lt;br&gt;/tasks/wait?agent=B" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#82b366;fontSize=9;fontColor=#82b366;" edge="1" source="daemon" target="cc-plugin" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- 多 Agent 共用标注 -->
+        <mxCell id="multi-agent-note" value="&lt;b&gt;同一 Daemon 管理多个 Agent&lt;/b&gt;&lt;br&gt;Agent A (opencode) + Agent B (Claude Code)&lt;br&gt;通过 agent_name 精确路由任务" style="text;html=1;fontSize=10;align=left;fillColor=#E8F5E9;strokeColor=#66BB6A;rounded=1;spacingLeft=8;spacingRight=8;" vertex="1" parent="1">
+          <mxGeometry x="670" y="570" width="300" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- ========== Server ↔ Daemon 连接线 ========== -->
+        <!-- Server → Daemon: POST /execute (推送任务) -->
+        <mxCell id="s-d" value="POST /execute&lt;br&gt;(推送任务)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#FF6600;strokeWidth=2;fontSize=10;fontColor=#FF6600;" edge="1" source="workflow" target="daemon" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="580" y="210"/>
+              <mxPoint x="580" y="135"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Daemon → Server: 注册/心跳 -->
+        <mxCell id="d-s-hb" value="POST /agents/register&lt;br&gt;POST /agents/heartbeat" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#999999;strokeWidth=1;dashed=1;fontSize=9;fontColor=#666666;" edge="1" source="daemon" target="registry" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="610" y="155"/>
+              <mxPoint x="610" y="270"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Daemon → Server: 回报结果 -->
+        <mxCell id="d-s-result" value="回报结果&lt;br&gt;POST /tasks/:id/result" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#0066FF;strokeWidth=2;fontSize=10;fontColor=#0066FF;dashed=1;" edge="1" source="daemon" target="workflow" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="595" y="170"/>
+              <mxPoint x="595" y="210"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Daemon → Server: Proposal (逆向提议) -->
+        <mxCell id="d-s-proposal" value="Proposal&lt;br&gt;(Client → Server)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;fontColor=#9C27B0;" edge="1" source="daemon" target="proposal-svc" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="625" y="180"/>
+              <mxPoint x="625" y="390"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Server → Daemon: OTA 推送 -->
+        <mxCell id="s-d-ota" value="OTA push&lt;br&gt;(版本落后时)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#E65100;strokeWidth=1;dashed=1;fontSize=9;fontColor=#E65100;" edge="1" source="ota-svc" target="daemon" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="565" y="450"/>
+              <mxPoint x="565" y="125"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ========== 外部注册表 ========== -->
+        <mxCell id="ext-registry" value="&lt;b&gt;外部注册表（可选）&lt;/b&gt;&lt;br&gt;飞书 bitable / Excel / 无" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#7B1FA2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="80" y="580" width="200" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="registry-link" value="双向同步&lt;br&gt;(可选)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#7B1FA2;fontSize=9;fontColor=#7B1FA2;" edge="1" source="registry-svc" target="ext-registry" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- ========== 标注区域 ========== -->
+        <mxCell id="note1" value="&lt;b&gt;核心设计&lt;/b&gt;：一台机器一个 Node Daemon（固定端口 4100）&lt;br&gt;多个 Agent (opencode / Claude Code) 共用同一 Daemon&lt;br&gt;通过 agent_name 精确路由任务，互不干扰" style="text;html=1;fontSize=11;align=left;fillColor=#FFF9C4;strokeColor=#F9A825;rounded=1;spacingLeft=8;spacingRight=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="680" width="420" height="55" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="note2" value="&lt;b&gt;全链路零轮询&lt;/b&gt;&lt;br&gt;Server → Daemon: HTTP push (POST /execute)&lt;br&gt;Daemon → Plugin: long-poll /tasks/wait?agent=xxx&lt;br&gt;结果等待: session.idle (opencode) / curl 回报 (Claude Code)" style="text;html=1;fontSize=10;align=left;fillColor=#E8F5E9;strokeColor=#66BB6A;rounded=1;spacingLeft=8;spacingRight=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="750" width="420" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="note3" value="&lt;b&gt;OTA 热更新流程&lt;/b&gt;&lt;br&gt;注册时版本检查 → 落后则推送 → Daemon 自更新 → 重启所有 Agent" style="text;html=1;fontSize=10;align=left;fillColor=#FFF3E0;strokeColor=#FF9800;rounded=1;spacingLeft=8;spacingRight=8;" vertex="1" parent="1">
+          <mxGeometry x="500" y="680" width="400" height="40" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="note4" value="&lt;b&gt;Proposal 逆向通道&lt;/b&gt;&lt;br&gt;Client Agent 发现问题/建议 → POST /proposals → Server 审核/执行" style="text;html=1;fontSize=10;align=left;fillColor=#F3E5F5;strokeColor=#9C27B0;rounded=1;spacingLeft=8;spacingRight=8;" vertex="1" parent="1">
+          <mxGeometry x="500" y="730" width="400" height="40" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="note5" value="&lt;b&gt;按需拉起&lt;/b&gt;&lt;br&gt;Daemon 收到任务但无 Plugin 连接 → screen -S maf-{name} 自动拉起 TUI" style="text;html=1;fontSize=10;align=left;fillColor=#E8F5E9;strokeColor=#4CAF50;rounded=1;spacingLeft=8;spacingRight=8;" vertex="1" parent="1">
+          <mxGeometry x="500" y="780" width="400" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- 版本标注 -->
+        <mxCell id="version" value="MAF v0.4.0 · 2025-01" style="text;html=1;fontSize=10;align=right;fontColor=#999999;" vertex="1" parent="1">
+          <mxGeometry x="1050" y="830" width="150" height="20" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

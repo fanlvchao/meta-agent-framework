@@ -1,0 +1,324 @@
+/**
+ * Meta-Agent-Server Runner — 有状态多轮编排
+ *
+ * Meta-Agent-Server 是 Server 端的主 Agent，
+ * 负责任务拆解和工作流 JSON 输出。它是多轮会话制的。
+ *
+ * 流程：
+ *   Round 1: 任务进入 → 调 Meta-Agent-Server → 它输出工作流
+ *   Round 2: 工作流执行完 → 汇总结果 → 再调 Meta-Agent-Server
+ *            "上一轮结果是...，从 agent 步骤进度是...，你要继续么？"
+ *   Round N: Meta-Agent-Server 说 DONE → 会话结束
+ *            Meta-Agent-Server 说要追加 → 新工作流 → 继续
+ *
+ * 历史会话保留在 Session 对象中，每轮的输入输出都记录。
+ * Meta-Agent-Server 每次被调用时能看到完整历史。
+ */
+
+import { spawn } from 'child_process';
+import path from 'path';
+import { v4 as uuidv4 } from 'uuid';
+import { agentRegistry } from './agent-registry';
+import { workflowEngine, WorkflowSummary } from './workflow-engine';
+import { eventBus } from './event-bus';
+import type { Agent, MASSession, SessionRound } from '../types';
+
+// ============================================================
+// 配置
+// ============================================================
+
+const OPENCODE_BIN = process.env.OPENCODE_BIN || 'opencode';
+const MAX_ROUNDS = parseInt(process.env.MAS_MAX_ROUNDS || '5');
+
+// ============================================================
+// 会话存储（内存）
+// ============================================================
+
+const sessions = new Map<string, MASSession>();
+
+// ============================================================
+// 核心
+// ============================================================
+
+export class MASRunner {
+
+  /**
+   * 提交任务 → 创建会话 → 开始第一轮
+   */
+  async submitTask(taskTitle: string, taskDescription: string): Promise<MASSession> {
+    const session: MASSession = {
+      id: uuidv4(),
+      title: taskTitle,
+      description: taskDescription,
+      status: 'active',
+      rounds: [],
+      max_rounds: MAX_ROUNDS,
+      created_at: new Date().toISOString(),
+    };
+
+    sessions.set(session.id, session);
+    console.log(`[MAS] 📋 新会话 ${session.id}: "${taskTitle}"`);
+
+    // 启动第一轮
+    await this.executeRound(session);
+
+    return session;
+  }
+
+  /**
+   * 执行一轮 Meta-Agent-Server 交互
+   *
+   * 1. 构建 prompt（含历史会话 + 当前 agent 网络 + 上一轮结果）
+   * 2. 调 opencode run --agent Meta-Agent-Server
+   * 3. 解析输出：如果有工作流 JSON → 创建工作流 → 等执行完 → 自动进入下一轮
+   *             如果没有（直接回答或 DONE）→ 会话结束
+   */
+  private async executeRound(session: MASSession): Promise<void> {
+    const roundNum = session.rounds.length + 1;
+
+    if (roundNum > session.max_rounds) {
+      console.warn(`[MAS] ⚠️ 会话 ${session.id} 达到最大轮次 ${session.max_rounds}，强制结束`);
+      session.status = 'completed';
+      session.completed_at = new Date().toISOString();
+      return;
+    }
+
+    const agents = agentRegistry.listAll();
+    const prompt = this.buildRoundPrompt(session, agents);
+
+    console.log(`[MAS] 🔄 Round ${roundNum} — "${session.title}"`);
+
+    let output: string;
+    try {
+      output = await this.runOpencode(prompt);
+    } catch (err: any) {
+      console.error(`[MAS] ❌ Round ${roundNum} 失败: ${err.message}`);
+      session.status = 'failed';
+      session.completed_at = new Date().toISOString();
+      session.rounds.push({
+        round: roundNum,
+        mas_input: prompt,
+        mas_output: `ERROR: ${err.message}`,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // 记录本轮
+    const round: SessionRound = {
+      round: roundNum,
+      mas_input: prompt,
+      mas_output: output,
+      timestamp: new Date().toISOString(),
+    };
+    session.rounds.push(round);
+
+    // 解析输出：有工作流 JSON 么？
+    const workflowJson = this.extractWorkflowJson(output);
+
+    if (!workflowJson) {
+      // 没有工作流 → Meta-Agent-Server 认为任务完成（直接回答或 DONE）
+      console.log(`[MAS] ✅ Round ${roundNum} — 无工作流输出，会话结束`);
+      session.status = 'completed';
+      session.completed_at = new Date().toISOString();
+      return;
+    }
+
+    // 有工作流 → 执行
+    console.log(`[MAS] 🔀 Round ${roundNum} — 创建工作流: "${workflowJson.title}" (${workflowJson.nodes.length} 节点)`);
+    session.status = 'waiting';  // 等待工作流执行
+
+    try {
+      const summary = await workflowEngine.run(workflowJson.title, workflowJson.nodes);
+      round.workflow_id = summary.workflow_id;
+      round.workflow_result = this.formatWorkflowResult(summary);
+
+      console.log(`[MAS] 📊 Round ${roundNum} 工作流 ${summary.status}`);
+
+      // 工作流执行完 → 自动进入下一轮
+      session.status = 'active';
+      await this.executeRound(session);
+
+    } catch (err: any) {
+      console.error(`[MAS] ❌ Round ${roundNum} 工作流异常: ${err.message}`);
+      round.workflow_result = `ERROR: ${err.message}`;
+      session.status = 'failed';
+      session.completed_at = new Date().toISOString();
+    }
+  }
+
+  /**
+   * 构建单轮 prompt — 包含完整历史上下文
+   */
+  private buildRoundPrompt(session: MASSession, agents: Agent[]): string {
+    const agentList = agents.length > 0
+      ? agents.map(a => {
+          const icon = a.status === 'online' ? '🟢' : a.status === 'busy' ? '🟡' : '🔴';
+          return `  ${icon} ${a.agent_name} (${a.mode}, ${a.runtime || 'opencode'}) — ${a.capabilities || '无描述'}`;
+        }).join('\n')
+      : '  （当前无可用 agent）';
+
+    const roundNum = session.rounds.length + 1;
+
+    let prompt = `# 任务
+
+**${session.title}**
+
+${session.description}
+
+# 当前 Agent 网络
+
+${agentList}
+`;
+
+    // 如果有历史轮次，拼入上下文
+    if (session.rounds.length > 0) {
+      prompt += `\n# 历史交互（共 ${session.rounds.length} 轮）\n`;
+
+      for (const r of session.rounds) {
+        prompt += `\n## Round ${r.round}\n`;
+        prompt += `### 你的决策\n${r.mas_output.slice(0, 2000)}\n`;  // 截断防超长
+        if (r.workflow_result) {
+          prompt += `### 执行结果\n${r.workflow_result}\n`;
+        }
+      }
+
+      prompt += `\n# 当前是 Round ${roundNum}
+
+基于以上历史结果，请判断：
+1. 如果从 agent 的步骤进度有未完成的 required 步骤 → 追加工作流
+2. 如果结果有问题需要修正 → 追加工作流
+3. 如果全部完成 → 直接输出最终总结（不要输出工作流 JSON）
+
+⚠️ 如果你认为任务已全部完成，请直接输出总结，不要输出 workflow JSON。
+`;
+    } else {
+      // 第一轮
+      prompt += `\n# 你的职责
+
+这是 Round 1。分析任务，决定调用哪些 agent 来完成。
+
+如果需要创建工作流，请用以下 JSON 格式输出：
+\`\`\`json
+{
+  "workflow": {
+    "title": "工作流标题",
+    "nodes": [
+      {"id": "step-1", "agent_name": "agent名", "prompt": "给agent的指令"},
+      {"id": "step-2", "agent_name": "agent名", "prompt": "指令", "depends_on": ["step-1"]}
+    ]
+  }
+}
+\`\`\`
+
+如果任务简单到你自己就能回答，直接输出结果（不要输出 workflow JSON）。
+`;
+    }
+
+    return prompt;
+  }
+
+  /**
+   * 从 Meta-Agent-Server 输出中提取工作流 JSON
+   */
+  private extractWorkflowJson(output: string): { title: string; nodes: any[] } | null {
+    // 尝试从 ```json ... ``` 中提取
+    const jsonMatch = output.match(/```json\s*([\s\S]*?)```/);
+    if (jsonMatch) {
+      try {
+        const parsed = JSON.parse(jsonMatch[1]);
+        if (parsed.workflow && Array.isArray(parsed.workflow.nodes)) {
+          return parsed.workflow;
+        }
+      } catch { /* 不是合法 JSON，忽略 */ }
+    }
+
+    // 尝试直接解析整个输出
+    try {
+      const parsed = JSON.parse(output);
+      if (parsed.workflow && Array.isArray(parsed.workflow.nodes)) {
+        return parsed.workflow;
+      }
+    } catch { /* 不是 JSON */ }
+
+    return null;
+  }
+
+  /**
+   * 格式化工作流结果给 Meta-Agent-Server 看
+   */
+  private formatWorkflowResult(summary: WorkflowSummary): string {
+    const lines = [`工作流 ${summary.status}（${summary.nodes.length} 节点）\n`];
+
+    for (const node of summary.nodes) {
+      const icon = node.status === 'completed' ? '✅' : node.status === 'failed' ? '❌' : '⏭️';
+      lines.push(`${icon} [${node.id}] ${node.agent_name}: ${node.status}`);
+      if (node.result) {
+        // 截取前 1000 字符，避免过长
+        const truncated = node.result.length > 1000
+          ? node.result.slice(0, 1000) + '\n...(截断)'
+          : node.result;
+        lines.push(truncated);
+      }
+      lines.push('');
+    }
+
+    return lines.join('\n');
+  }
+
+  /**
+   * 执行 opencode run --agent Meta-Agent-Server
+   */
+  private runOpencode(prompt: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(OPENCODE_BIN, [
+        'run', '--agent', 'Meta-Agent-Server', prompt,
+      ], {
+        cwd: path.resolve(__dirname, '../..'),  // npm 包根目录
+        timeout: 600_000,
+        env: {
+          ...process.env,
+          OPENCODE_AGENTS_DIR: path.resolve(__dirname, '../../.opencode/agents'),
+          MAF_HOME: process.env.MAF_HOME || path.join(require('os').homedir(), '.meta-agent-framework'),
+        },
+      });
+
+      let stdout = '', stderr = '';
+      child.stdout?.on('data', d => { stdout += d; });
+      child.stderr?.on('data', d => { stderr += d; });
+      child.on('close', code => {
+        code === 0
+          ? resolve(stdout.trim() || 'Completed (no output)')
+          : reject(new Error(`opencode exited ${code}: ${stderr || stdout}`));
+      });
+      child.on('error', e => reject(new Error(`spawn failed: ${e.message}`)));
+    });
+  }
+
+  // ============================================================
+  // 查询
+  // ============================================================
+
+  getSession(id: string): MASSession | undefined {
+    return sessions.get(id);
+  }
+
+  listSessions(): MASSession[] {
+    return Array.from(sessions.values()).sort((a, b) =>
+      b.created_at.localeCompare(a.created_at)
+    );
+  }
+
+  /**
+   * 直接提交工作流（跳过自动编排，手动指定）
+   */
+  async submitWorkflow(
+    title: string,
+    nodes: { id: string; agent_name: string; prompt: string; depends_on?: string[] }[],
+  ) {
+    console.log(`[MAS] 🔄 手动工作流: "${title}" (${nodes.length} 步)`);
+    return workflowEngine.run(title, nodes);
+  }
+}
+
+export const masRunner = new MASRunner();

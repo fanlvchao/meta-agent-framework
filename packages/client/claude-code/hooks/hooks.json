@@ -1,0 +1,23 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/maf-agent.mjs --daemon",
+            "timeout": 15,
+            "statusMessage": "MAF: 启动 Agent Daemon..."
+          },
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/maf-agent.mjs --wait",
+            "asyncRewake": true,
+            "timeout": 86400,
+            "statusMessage": "MAF: 等待远程任务..."
+          }
+        ]
+      }
+    ]
+  }
+}
