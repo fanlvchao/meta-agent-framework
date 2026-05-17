@@ -17,8 +17,8 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Install server dependencies
+        run: cd packages/server && npm ci
 
       - name: Pack server
         run: cd packages/server && npm pack
