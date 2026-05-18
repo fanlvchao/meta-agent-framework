@@ -26,10 +26,45 @@ jobs:
       - name: Pack client
         run: cd packages/client && npm pack
 
+      # Rename tgz to fixed names for stable download URLs
+      - name: Rename packages
+        run: |
+          mv packages/server/*.tgz packages/server/meta-agent-server.tgz
+          mv packages/client/*.tgz packages/client/meta-agent-client.tgz
+
+      # Create versioned release (e.g. v0.4.0)
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            packages/server/*.tgz
-            packages/client/*.tgz
+            packages/server/meta-agent-server.tgz
+            packages/client/meta-agent-client.tgz
+
+      # Update "latest" release — always points to the newest version
+      # This enables a stable install URL:
+      #   npm i -g https://github.com/.../releases/download/latest/meta-agent-server.tgz
+      - name: Update latest release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest Release
+          body: |
+            This release always points to the latest stable version.
+
+            ## Install
+            ```bash
+            npm install -g https://github.com/fanlvchao/meta-agent-framework/releases/download/latest/meta-agent-server.tgz
+            npm install -g https://github.com/fanlvchao/meta-agent-framework/releases/download/latest/meta-agent-client.tgz
+            ```
+          prerelease: false
+          make_latest: false
+          files: |
+            packages/server/meta-agent-server.tgz
+            packages/client/meta-agent-client.tgz
+
+      # Move the "latest" tag to current commit so next run replaces it
+      - name: Force-update latest tag
+        run: |
+          git tag -f latest
+          git push -f origin latest
