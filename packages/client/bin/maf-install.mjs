@@ -15,7 +15,7 @@
  *   环境变量:     META_AGENT_SERVER + MAF_NODE_PORT → ~/.bashrc
  */
 
-import { existsSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, appendFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, copyFileSync, cpSync, writeFileSync, readFileSync, appendFileSync, unlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { execSync } from "node:child_process";
@@ -364,8 +364,17 @@ if (!env.hasOpencode && !env.hasClaude) {
   log("  安装 opencode:    curl -fsSL https://opencode.ai/install | bash");
   log("  安装 Claude Code: npm install -g @anthropic-ai/claude-code");
   if (cmd === "--auto") {
-    // postinstall 静默退出，不阻塞 npm install
-    log("\n  npm 包已安装，后续安装 opencode/claude 后运行: maf-client install\n");
+    // postinstall: 如果 Plugin 已安装过，整个目录覆盖更新
+    const pluginDir = join(HOME, ".config", "opencode", "plugins", "opencode-plugin-meta-agent-framework");
+    if (existsSync(pluginDir)) {
+      const srcDir = join(PKG_ROOT, "opencode");
+      try { cpSync(srcDir, pluginDir, { recursive: true, force: true }); } catch {}
+    }
+    const ccPluginDir = join(HOME, ".claude", "plugins", "marketplaces", "maf-plugins", "claude-code-plugin-maf");
+    if (existsSync(ccPluginDir)) {
+      const ccSrcDir = join(PKG_ROOT, "claude-code");
+      try { cpSync(ccSrcDir, ccPluginDir, { recursive: true, force: true }); } catch {}
+    }
     process.exit(0);
   }
   process.exit(1);

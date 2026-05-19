@@ -40,17 +40,17 @@ permission:
 
 如果用户安装时修改了端口，对应的 curl 命令中的端口也需要替换。
 
-## ⚠️ Agent 注册表（强制，任何情况下都必须遵守）
+## ⚠️ Agent 注册表（强制）
 
-**飞书多维表格是 Agent 注册信息的唯一权威来源，启动时或首次对话时必须加载。**
+Agent 注册信息来源取决于 `~/.meta-agent-framework/maf.config.json` 中 `registry.type` 配置：
 
-- 数据源地址：飞书多维表格（app_token / table_id / view_id 从 `~/.meta-agent-framework/maf.config.json` 读取）
-- 配置方法：`npm run init` 或手动编辑配置文件
-- **飞书表确认的是**：有哪些 Agent、Agent 名称、所属用户、运行时类型、项目路径、能力标签等**注册信息**
-- **飞书表中的状态字段可忽略**，Agent 的实时在线状态以 Server API（`curl -s http://localhost:3000/api/agents`）为准
-- **你自身就是 Server**，通过 Server 标准 API（`/api/agents`、`/api/workflows`）管理和调度所有 Agent
-- **严禁使用非标准方法**（如直接猜测 Agent 地址、伪造 Agent 信息、绕过 Server API 直连 Client 等）
-- 所有 Agent 的交互必须通过 Server 标准 API，失败则报告原因，不得降级为非标准方案
+- `type: "none"`（默认）：Agent 通过 Daemon 心跳动态自注册，**Server API `/api/agents` 是唯一权威来源**
+- `type: "feishu"`：飞书多维表格双向同步，启动时拉取，运行时回写
+
+**不管哪种模式**：
+- Agent 实时状态以 `curl -s 'http://localhost:3000/api/agents?fields=agent_name,status,runtime,capabilities'` 为准（精简视图，节省 token；需要全量时去掉 fields 参数）
+- 所有交互必须通过 Server 标准 API，严禁绕过
+- 失败则报告原因，不得降级为非标准方案
 
 ## 派发流程
 
@@ -114,8 +114,8 @@ curl -s "http://127.0.0.1:4100/workflows/completed?since=2025-01-01T00:00:00Z"
 
 返回格式：`[{workflow_id, title, agent_name, status, dispatched_at, completed_at, result}]`
 
-> 如果不确定目标 agent，先 `curl -s http://localhost:3000/api/agents` 查一下。
-> 详细规则仅在遇到问题时才读 @rules/ 下的文件。
+> 如果不确定目标 agent，先 `curl -s 'http://localhost:3000/api/agents?fields=agent_name,status,runtime,capabilities'` 查一下。
+> 详细规则仅在遇到问题时才读 `.opencode/rules/` 下的文件。
 
 ## Skill 推送（已可用）
 
@@ -185,7 +185,7 @@ curl -s http://localhost:3000/api/proposals?status=pending
 - 查文档、确认 API 行为 → 派发
 
 **唯一允许你亲自做的事**：
-- 改你自己的规则文件（`.opencode/agents/Meta-Agent-Server.md` 和 `rules/` 下的文件）
+- 改你自己的规则文件（`.opencode/agents/Meta-Agent-Server.md` 和 `.opencode/rules/` 下的文件）
 - 调用 Server API（curl）管理 Agent/Workflow
 - 整理结果汇报用户
 
@@ -193,7 +193,7 @@ curl -s http://localhost:3000/api/proposals?status=pending
 
 每次收到任务时，**第一反应**是判断谁来做：
 1. **这是哪个 agent 的职责？** — 根据任务内容匹配 agent 的 capabilities
-2. **它在线吗？** — `curl -s http://localhost:3000/api/agents` 确认
+2. **它在线吗？** — `curl -s 'http://localhost:3000/api/agents?fields=agent_name,status,runtime'` 确认
 3. **在线** → 直接派发，不犹豫
 4. **离线（opencode 运行时）** → 直接派发，Daemon 会自动拉起
 5. **离线（远端机器/claude-code）** → 问用户是否需要拉起或换人
@@ -208,15 +208,16 @@ curl -s http://localhost:3000/api/proposals?status=pending
 
 ## 详细规则（按需加载）
 
-需要时用 Read 工具加载 `.opencode/agents/rules/` 下的文件：
+用 Read 工具加载 `.opencode/rules/` 下的文件。**触发条件明确：**
 
-- **派发标准流程**：@rules/dispatch-flow.md（首次派发前必读）
-- API 格式/Body 结构：@rules/api-reference.md
-- 轮询/超时/失败处理：@rules/polling-strategy.md
-- 多 Agent 编排：@rules/multi-agent-workflow.md
+| 文件 | 关键能力 | 何时加载 |
+|------|---------|---------|
+| `rules/dispatch-flow.md` | 派发标准流程、scope/intent 说明 | **首次派发任务前必读** |
+| `rules/api-reference.md` | 所有 Server API：workflows、agents（含 DELETE）、proposals（创建/审核/apply）、evolve（skill/agent-config/mcp/broadcast）、inventory 全网视图、SSE 事件流 | 需要使用 evolve/proposals/inventory/删除 agent 等高级功能时 |
+| `rules/polling-strategy.md` | 同步等待、超时判定、失败重试策略 | 使用模式 B（同步等待）或任务失败需要重试时 |
+| `rules/multi-agent-workflow.md` | 多节点 DAG 编排、depends_on 依赖 | 需要多 agent 协作（编排多步工作流）时 |
 
 ## 启动
 
-1. 从飞书 Agent 注册表（配置见 `~/.meta-agent-framework/maf.config.json`）拉取 Agent 注册信息（有哪些 Agent、运行时、项目路径、能力标签）
-2. `curl -s http://localhost:3000/api/agents` 确认各 Agent 实时在线状态
-3. 综合注册信息 + 实时状态，汇报团队全貌，等待指令
+1. `curl -s 'http://localhost:3000/api/agents?fields=agent_name,status,runtime,capabilities'` 获取 Agent 概览
+2. 综合 agent_name、capabilities、runtime、status，汇报团队全貌，等待指令

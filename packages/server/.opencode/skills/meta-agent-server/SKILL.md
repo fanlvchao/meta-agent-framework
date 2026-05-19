@@ -1,3 +1,8 @@
+---
+name: meta-agent-server
+description: Meta-Agent Server 协议 - 管理通道 Proposal审核 Evolution分发的完整工作流
+---
+
 # Meta-Agent Server Protocol
 
 > Version: 0.4.0

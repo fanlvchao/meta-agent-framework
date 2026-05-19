@@ -51,7 +51,7 @@ DAEMON_URL="http://127.0.0.1:$NODE_PORT"
 # ============================================================
 # 参数解析：确定要跑哪些 case
 # ============================================================
-ALL_CASES=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21)
+ALL_CASES=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27)
 RUN_CASES=()
 
 if [[ $# -eq 0 ]]; then
@@ -271,10 +271,10 @@ D_HEALTH=$(curl -s $DAEMON_URL/health 2>/dev/null || echo '{}')
 assert "Daemon 管理 OC agent" "$AGENT_NAME" "$D_HEALTH"
 assert "Daemon 管理 CC agent" "$CC_AGENT" "$D_HEALTH"
 wait_until 5 "get_agent_field status $CC_AGENT" "online" || true
-assert "CC 注册 online" "online" "$(get_agent_field status $CC_AGENT)"
+assert "CC 注册 online（刚连接）" "online" "$(get_agent_field status $CC_AGENT)"
 assert "两个 agent 共用 endpoint" ":$NODE_PORT" "$(get_agent_field client_endpoint $CC_AGENT)"
 assert "OC 心跳后 online" "online" "$(get_agent_field status)"
-assert "CC 心跳后 online" "online" "$(get_agent_field status $CC_AGENT)"
+assert "CC 心跳后 online（lastSeen 新鲜）" "online" "$(get_agent_field status $CC_AGENT)"
 fi
 
 # ============================================================
@@ -804,6 +804,213 @@ assert "OC workflow 有结果" "OC workflow 执行结果 OK" "$FINAL_RESULT"
 kill $OC_WF_WORKER 2>/dev/null
 curl -s -X POST "$DAEMON_URL/agents/disconnect" -H 'Content-Type: application/json' \
   -d "{\"agent_name\":\"$OC_WF_AGENT\"}" >/dev/null 2>&1
+fi
+
+# ============================================================
+# Case 22: DELETE /api/agents/:id
+# ============================================================
+if should_run 22; then
+echo -e "${YELLOW}[22] DELETE /api/agents/:id${NC}"
+
+# 直接通过 Server API 注册一个临时 agent
+DEL_AGENT="del-test-agent"
+curl -s -X POST "$E2E_SERVER/api/clients/register" -H 'Content-Type: application/json' \
+  -d "{\"user_id\":\"e2e\",\"host_user\":\"e2e\",\"client_endpoint\":\"http://127.0.0.1:$NODE_PORT\",\"agents\":[{\"agent_name\":\"$DEL_AGENT\",\"runtime\":\"opencode\",\"project_path\":\"/tmp\",\"capabilities\":\"test\",\"mode\":\"subagent\"}]}" >/dev/null 2>&1
+
+DEL_ID=$(curl -s "$E2E_SERVER/api/agents" 2>/dev/null | python3 -c "import json,sys;agents=json.load(sys.stdin);print(next((a['id'] for a in agents if a['agent_name']=='$DEL_AGENT'),''))" 2>/dev/null)
+assert "有 agent 可删" "true" "$([ -n "$DEL_ID" ] && echo true || echo false)"
+
+# 删除
+DEL_RES=$(curl -s -X DELETE "$E2E_SERVER/api/agents/$DEL_ID" 2>/dev/null)
+assert "DELETE 200" "$DEL_ID" "$(echo "$DEL_RES" | python3 -c "import json,sys;print(json.load(sys.stdin).get('id',''))" 2>/dev/null)"
+
+# 再删同一个 → 404
+DEL_404=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$E2E_SERVER/api/agents/$DEL_ID" 2>/dev/null)
+assert "DELETE 404" "404" "$DEL_404"
+
+# 清理
+curl -s -X POST "$DAEMON_URL/agents/disconnect" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$DEL_AGENT\"}" >/dev/null 2>&1
+fi
+
+# ============================================================
+# Case 23: GET /api/agents?fields= 过滤
+# ============================================================
+if should_run 23; then
+echo -e "${YELLOW}[23] GET /api/agents?fields= 过滤${NC}"
+
+# 确保有 agent（直接注册）
+curl -s -X POST "$E2E_SERVER/api/clients/register" -H 'Content-Type: application/json' \
+  -d "{\"user_id\":\"e2e\",\"host_user\":\"e2e\",\"client_endpoint\":\"http://127.0.0.1:$NODE_PORT\",\"agents\":[{\"agent_name\":\"fields-test-agent\",\"runtime\":\"opencode\",\"project_path\":\"/tmp\",\"capabilities\":\"test\",\"mode\":\"subagent\"}]}" >/dev/null 2>&1
+
+# 请求全量
+FULL=$(curl -s "$E2E_SERVER/api/agents" 2>/dev/null | python3 -c "import json,sys;a=json.load(sys.stdin);print(len(a[0].keys()) if a else 0)" 2>/dev/null)
+assert "全量字段 > 5" "true" "$([ "$FULL" -gt 5 ] && echo true || echo false)"
+
+# 请求精简
+FIELDS_RES=$(curl -s "$E2E_SERVER/api/agents?fields=agent_name,status" 2>/dev/null)
+FIELD_COUNT=$(echo "$FIELDS_RES" | python3 -c "import json,sys;a=json.load(sys.stdin);print(len(a[0].keys()) if a else 0)" 2>/dev/null)
+assert "fields 过滤只有 2 个字段" "2" "$FIELD_COUNT"
+HAS_NAME=$(echo "$FIELDS_RES" | python3 -c "import json,sys;a=json.load(sys.stdin);print('agent_name' in a[0] if a else False)" 2>/dev/null)
+assert "fields 含 agent_name" "True" "$HAS_NAME"
+fi
+
+# ============================================================
+# Case 24: CC next_task 续传
+# ============================================================
+if should_run 24; then
+echo -e "${YELLOW}[24] CC next_task 续传${NC}"
+
+CC_CHAIN_AGENT="cc-chain-e2e"
+curl -s -X POST "$DAEMON_URL/agents/connect" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$CC_CHAIN_AGENT\",\"runtime\":\"claude-code\"}" >/dev/null 2>&1
+sleep 1
+
+# 入队 3 个任务
+curl -s -X POST "$DAEMON_URL/execute" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$CC_CHAIN_AGENT\",\"workflow_id\":\"chain-1\",\"node_id\":\"n1\",\"prompt\":\"chain task 1\",\"intent\":\"query\"}" >/dev/null 2>&1
+curl -s -X POST "$DAEMON_URL/execute" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$CC_CHAIN_AGENT\",\"workflow_id\":\"chain-2\",\"node_id\":\"n2\",\"prompt\":\"chain task 2\",\"intent\":\"query\"}" >/dev/null 2>&1
+curl -s -X POST "$DAEMON_URL/execute" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$CC_CHAIN_AGENT\",\"workflow_id\":\"chain-3\",\"node_id\":\"n3\",\"prompt\":\"chain task 3\",\"intent\":\"query\"}" >/dev/null 2>&1
+
+# 模拟 CC: take 第一个
+TAKE1=$(curl -s -X POST "$DAEMON_URL/tasks/take?agent=$CC_CHAIN_AGENT" 2>/dev/null)
+TID1=$(echo "$TAKE1" | python3 -c "import json,sys;t=json.load(sys.stdin).get('task');print(t['id'] if t else '')" 2>/dev/null)
+assert "take 第一个任务" "true" "$([ -n "$TID1" ] && echo true || echo false)"
+
+# 回报第一个 → 检查 next_task
+DONE1=$(curl -s -X POST "$DAEMON_URL/tasks/done" -H 'Content-Type: application/json' \
+  -d "{\"task_id\":\"$TID1\",\"agent_name\":\"$CC_CHAIN_AGENT\",\"status\":\"completed\",\"result\":\"done1\"}" 2>/dev/null)
+NEXT1=$(echo "$DONE1" | python3 -c "import json,sys;d=json.load(sys.stdin);nt=d.get('next_task');print(nt['id'] if nt else '')" 2>/dev/null)
+assert "next_task 有第二个" "true" "$([ -n "$NEXT1" ] && echo true || echo false)"
+
+# 回报第二个 → 检查 next_task
+DONE2=$(curl -s -X POST "$DAEMON_URL/tasks/done" -H 'Content-Type: application/json' \
+  -d "{\"task_id\":\"$NEXT1\",\"agent_name\":\"$CC_CHAIN_AGENT\",\"status\":\"completed\",\"result\":\"done2\"}" 2>/dev/null)
+NEXT2=$(echo "$DONE2" | python3 -c "import json,sys;d=json.load(sys.stdin);nt=d.get('next_task');print(nt['id'] if nt else '')" 2>/dev/null)
+assert "next_task 有第三个" "true" "$([ -n "$NEXT2" ] && echo true || echo false)"
+
+# 回报第三个 → next_task 应为 null
+DONE3=$(curl -s -X POST "$DAEMON_URL/tasks/done" -H 'Content-Type: application/json' \
+  -d "{\"task_id\":\"$NEXT2\",\"agent_name\":\"$CC_CHAIN_AGENT\",\"status\":\"completed\",\"result\":\"done3\"}" 2>/dev/null)
+NEXT3=$(echo "$DONE3" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('next_task'))" 2>/dev/null)
+assert "next_task 队列空" "None" "$NEXT3"
+
+# 清理
+curl -s -X POST "$DAEMON_URL/agents/disconnect" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$CC_CHAIN_AGENT\"}" >/dev/null 2>&1
+fi
+
+# ============================================================
+# Case 25: SSE 结果不串扰
+# ============================================================
+if should_run 25; then
+echo -e "${YELLOW}[25] SSE 结果不串扰${NC}"
+
+# 注册两个 agent
+SSE_AGENT1="sse-agent1"
+SSE_AGENT2="sse-agent2"
+curl -s -X POST "$DAEMON_URL/agents/connect" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$SSE_AGENT1\",\"runtime\":\"opencode\",\"plugin_pid\":$$}" >/dev/null 2>&1
+curl -s -X POST "$DAEMON_URL/agents/connect" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$SSE_AGENT2\",\"runtime\":\"opencode\",\"plugin_pid\":$$}" >/dev/null 2>&1
+sleep 2
+
+# 给 agent1 发任务
+WF_SSE=$(curl -s -X POST "$E2E_SERVER/api/workflows" -H 'Content-Type: application/json' \
+  -d "{\"title\":\"sse-test\",\"nodes\":[{\"id\":\"s1\",\"agent_name\":\"$SSE_AGENT1\",\"prompt\":\"test\",\"scope\":\"project\",\"intent\":\"query\"}]}" 2>/dev/null)
+WF_SSE_ID=$(echo "$WF_SSE" | python3 -c "import json,sys;print(json.load(sys.stdin).get('workflow_id',''))" 2>/dev/null)
+sleep 1
+
+# agent1 取任务并完成
+TAKE_SSE=$(curl -s -X POST "$DAEMON_URL/tasks/take?agent=$SSE_AGENT1" 2>/dev/null)
+TID_SSE=$(echo "$TAKE_SSE" | python3 -c "import json,sys;t=json.load(sys.stdin).get('task');print(t['id'] if t else '')" 2>/dev/null)
+curl -s -X POST "$DAEMON_URL/tasks/done" -H 'Content-Type: application/json' \
+  -d "{\"task_id\":\"$TID_SSE\",\"agent_name\":\"$SSE_AGENT1\",\"status\":\"completed\",\"result\":\"agent1-result\"}" >/dev/null 2>&1
+sleep 2
+
+# 验证 workflow 完成
+WF_SSE_STATUS=$(curl -s "$E2E_SERVER/api/workflows/$WF_SSE_ID" 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
+assert "SSE workflow completed" "completed" "$WF_SSE_STATUS"
+
+# agent2 的队列应该是空的（没有串扰的任务结果推到它那里）
+AGENT2_Q=$(curl -s "$DAEMON_URL/tasks/take?agent=$SSE_AGENT2" 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('task'))" 2>/dev/null)
+assert "agent2 无串扰任务" "None" "$AGENT2_Q"
+
+# 清理
+curl -s -X POST "$DAEMON_URL/agents/disconnect" -H 'Content-Type: application/json' -d "{\"agent_name\":\"$SSE_AGENT1\"}" >/dev/null 2>&1
+curl -s -X POST "$DAEMON_URL/agents/disconnect" -H 'Content-Type: application/json' -d "{\"agent_name\":\"$SSE_AGENT2\"}" >/dev/null 2>&1
+fi
+
+# ============================================================
+# Case 26: CC agent 超时变 offline
+# ============================================================
+if should_run 26; then
+echo -e "${YELLOW}[26] CC agent 超时变 offline${NC}"
+
+CC_TIMEOUT_AGENT="cc-timeout-e2e"
+curl -s -X POST "$DAEMON_URL/agents/connect" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$CC_TIMEOUT_AGENT\",\"runtime\":\"claude-code\"}" >/dev/null 2>&1
+sleep 2
+
+# 刚注册，应该 online（lastSeen 新鲜）
+wait_until 5 "get_agent_field status $CC_TIMEOUT_AGENT" "online" || true
+assert "CC 刚注册 online" "online" "$(get_agent_field status $CC_TIMEOUT_AGENT)"
+
+# 等 16s（超过 15s 阈值），不再 touchAgent
+sleep 16
+
+# 此时 lastSeen 超时，应该 offline
+wait_until 5 "get_agent_field status $CC_TIMEOUT_AGENT" "offline" || true
+assert "CC 超时后 offline" "offline" "$(get_agent_field status $CC_TIMEOUT_AGENT)"
+
+# 清理
+curl -s -X POST "$DAEMON_URL/agents/disconnect" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$CC_TIMEOUT_AGENT\"}" >/dev/null 2>&1
+fi
+
+# ============================================================
+# Case 27: CC --wait Daemon 重启后自动重连
+# ============================================================
+if should_run 27; then
+echo -e "${YELLOW}[27] CC --wait Daemon 重启后自动重连${NC}"
+
+CC_RECONNECT_AGENT="cc-reconnect-e2e"
+
+# 启动 CC --wait 进程（后台）
+MAF_AGENT_NAME="$CC_RECONNECT_AGENT" MAF_RUNTIME="claude-code" \
+MAF_NODE_PORT=$NODE_PORT MAF_DIRECTORY="/tmp" MAF_USER_ID="e2e-testuser" \
+META_AGENT_SERVER="$E2E_SERVER" \
+node plugins/claude-code-plugin-maf/scripts/maf-agent.mjs --daemon &>/dev/null
+MAF_AGENT_NAME="$CC_RECONNECT_AGENT" MAF_RUNTIME="claude-code" \
+MAF_NODE_PORT=$NODE_PORT MAF_DIRECTORY="/tmp" MAF_USER_ID="e2e-testuser" \
+META_AGENT_SERVER="$E2E_SERVER" \
+node plugins/claude-code-plugin-maf/scripts/maf-agent.mjs --wait &>/dev/null &
+CC_WAIT_PID=$!
+sleep 2
+
+# 确认 agent 在线
+wait_until 5 "get_agent_field status $CC_RECONNECT_AGENT" "online" || true
+assert "CC wait 启动后 online" "online" "$(get_agent_field status $CC_RECONNECT_AGENT)"
+
+# 杀 Daemon
+DAEMON_PID=$(ss -tlnp 2>/dev/null | grep ":$NODE_PORT " | grep -oP 'pid=\K\d+' | head -1)
+[[ -n "$DAEMON_PID" ]] && kill -9 "$DAEMON_PID" 2>/dev/null
+sleep 1
+
+# 用 mock-opencode 拉起新 Daemon（模拟 OC Plugin 拉起）
+start_mock_opencode
+sleep 5
+
+# CC --wait 应该自动重连到新 Daemon
+wait_until 15 "get_agent_field status $CC_RECONNECT_AGENT" "online" || true
+assert "CC wait 重连后 online" "online" "$(get_agent_field status $CC_RECONNECT_AGENT)"
+
+# 清理
+kill $CC_WAIT_PID 2>/dev/null
+curl -s -X POST "$DAEMON_URL/agents/disconnect" -H 'Content-Type: application/json' \
+  -d "{\"agent_name\":\"$CC_RECONNECT_AGENT\"}" >/dev/null 2>&1
 fi
 
 # ============================================================

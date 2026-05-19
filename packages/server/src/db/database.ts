@@ -1,31 +1,155 @@
-import Database from 'better-sqlite3';
+/**
+ * SQLite 存储（基于 sql.js — 纯 WASM/asm.js，零原生编译）
+ *
+ * 对外暴露与 better-sqlite3 兼容的同步 API（prepare/run/get/all/exec），
+ * 内部使用 sql.js。
+ *
+ * 使用前必须先调用 initDb()（async），之后 getDb() 同步可用。
+ * 数据文件：~/.meta-agent-framework/data/maf.db
+ */
+
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
 
 const MAF_HOME = process.env.MAF_HOME || path.join(os.homedir(), '.meta-agent-framework');
-const DB_PATH = process.env.DB_PATH || path.join(MAF_HOME, 'data', 'meta-agent.db');
+const DATA_DIR = path.join(MAF_HOME, 'data');
+const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, 'maf.db');
 
-let db: Database.Database;
+// ============================================================
+// sql.js 实例
+// ============================================================
 
-export function getDb(): Database.Database {
-  if (!db) {
-    const dir = path.dirname(DB_PATH);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
+let sqlJsDb: any = null;
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
 
-    db = new Database(DB_PATH);
-    db.pragma('journal_mode = WAL');
-    db.pragma('foreign_keys = ON');
-    initTables(db);
+function ensureDir(): void {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
   }
-  return db;
 }
 
-function initTables(db: Database.Database): void {
-  db.exec(`
-    -- Agent 注册表
+function scheduleSave(): void {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    persistDb();
+  }, 200);
+}
+
+function persistDb(): void {
+  if (!sqlJsDb) return;
+  try {
+    const data = sqlJsDb.export();
+    const buffer = Buffer.from(data);
+    ensureDir();
+    fs.writeFileSync(DB_PATH, buffer);
+  } catch (err) {
+    console.error('[DB] Failed to persist:', err);
+  }
+}
+
+// ============================================================
+// 初始化（async，Server 启动时调用一次）
+// ============================================================
+
+export async function initDb(): Promise<void> {
+  if (sqlJsDb) return;
+
+  ensureDir();
+
+  const initSqlJs = require('sql.js/dist/sql-asm.js');
+  const SQL = await initSqlJs();
+
+  // 尝试加载已有数据库文件
+  if (fs.existsSync(DB_PATH) && fs.statSync(DB_PATH).size > 0) {
+    const buffer = fs.readFileSync(DB_PATH);
+    sqlJsDb = new SQL.Database(buffer);
+  } else {
+    sqlJsDb = new SQL.Database();
+  }
+
+  initTables();
+  persistDb();
+}
+
+// ============================================================
+// 兼容 better-sqlite3 的 API 包装
+// ============================================================
+
+interface RunResult {
+  changes: number;
+  lastInsertRowid: number | bigint;
+}
+
+interface Statement {
+  run(...params: any[]): RunResult;
+  get(...params: any[]): any;
+  all(...params: any[]): any[];
+}
+
+interface DatabaseLike {
+  prepare(sql: string): Statement;
+  exec(sql: string): void;
+  pragma(str: string): any;
+  close(): void;
+}
+
+function createStatement(sql: string): Statement {
+  return {
+    run(...params: any[]): RunResult {
+      try {
+        sqlJsDb.run(sql, params);
+        const changes = sqlJsDb.getRowsModified();
+        scheduleSave();
+        return { changes, lastInsertRowid: 0 };
+      } catch (err: any) {
+        console.error(`[DB] run error: ${err.message}\n  SQL: ${sql.slice(0, 200)}`);
+        return { changes: 0, lastInsertRowid: 0 };
+      }
+    },
+
+    get(...params: any[]): any {
+      try {
+        const stmt = sqlJsDb.prepare(sql);
+        if (params.length > 0) stmt.bind(params);
+        if (stmt.step()) {
+          const row = stmt.getAsObject();
+          stmt.free();
+          return row;
+        }
+        stmt.free();
+        return undefined;
+      } catch (err: any) {
+        console.error(`[DB] get error: ${err.message}\n  SQL: ${sql.slice(0, 200)}`);
+        return undefined;
+      }
+    },
+
+    all(...params: any[]): any[] {
+      try {
+        const stmt = sqlJsDb.prepare(sql);
+        if (params.length > 0) stmt.bind(params);
+        const results: any[] = [];
+        while (stmt.step()) {
+          results.push(stmt.getAsObject());
+        }
+        stmt.free();
+        return results;
+      } catch (err: any) {
+        console.error(`[DB] all error: ${err.message}\n  SQL: ${sql.slice(0, 200)}`);
+        return [];
+      }
+    }
+  };
+}
+
+// ============================================================
+// 表初始化
+// ============================================================
+
+function initTables(): void {
+  sqlJsDb.run(`
     CREATE TABLE IF NOT EXISTS agents (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL DEFAULT '',
@@ -45,11 +169,10 @@ function initTables(db: Database.Database): void {
       daemon_port INTEGER NOT NULL DEFAULT 0,
       registered_at TEXT NOT NULL,
       UNIQUE(user_id, host_user, agent_name)
-    );
+    )
+  `);
 
-    
-
-    -- 任务表
+  sqlJsDb.run(`
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY,
       type TEXT NOT NULL DEFAULT 'custom',
@@ -64,11 +187,11 @@ function initTables(db: Database.Database): void {
       metadata TEXT NOT NULL DEFAULT '{}',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
-      completed_at TEXT,
-      FOREIGN KEY (assigned_agent_id) REFERENCES agents(id) ON DELETE SET NULL
-    );
+      completed_at TEXT
+    )
+  `);
 
-    -- Feedback 记录表
+  sqlJsDb.run(`
     CREATE TABLE IF NOT EXISTS feedback (
       id TEXT PRIMARY KEY,
       task_id TEXT NOT NULL,
@@ -82,12 +205,11 @@ function initTables(db: Database.Database): void {
       model TEXT NOT NULL DEFAULT '',
       summary TEXT NOT NULL DEFAULT '',
       score REAL,
-      created_at TEXT NOT NULL,
-      FOREIGN KEY (task_id) REFERENCES tasks(id),
-      FOREIGN KEY (agent_id) REFERENCES agents(id)
-    );
+      created_at TEXT NOT NULL
+    )
+  `);
 
-    -- Proposal 提议表（Client → Server 逆向通道）
+  sqlJsDb.run(`
     CREATE TABLE IF NOT EXISTS proposals (
       id TEXT PRIMARY KEY,
       from_agent TEXT NOT NULL,
@@ -105,67 +227,75 @@ function initTables(db: Database.Database): void {
       reviewed_by TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
-    );
-
-    -- 索引
-    CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
-    CREATE INDEX IF NOT EXISTS idx_agents_user ON agents(user_id);
-    CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-    CREATE INDEX IF NOT EXISTS idx_tasks_agent ON tasks(assigned_agent_id);
-    CREATE INDEX IF NOT EXISTS idx_feedback_agent ON feedback(agent_id);
-    CREATE INDEX IF NOT EXISTS idx_feedback_task ON feedback(task_id);
-    CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status);
-    CREATE INDEX IF NOT EXISTS idx_proposals_agent ON proposals(from_agent);
-    CREATE INDEX IF NOT EXISTS idx_proposals_type ON proposals(type);
+    )
   `);
 
-  // 兼容旧数据库：自动迁移缺失列
-  migrateColumns(db);
+  // 索引
+  sqlJsDb.run("CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status)");
+  sqlJsDb.run("CREATE INDEX IF NOT EXISTS idx_agents_user ON agents(user_id)");
+  sqlJsDb.run("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)");
+  sqlJsDb.run("CREATE INDEX IF NOT EXISTS idx_tasks_agent ON tasks(assigned_agent_id)");
+  sqlJsDb.run("CREATE INDEX IF NOT EXISTS idx_feedback_agent ON feedback(agent_id)");
+  sqlJsDb.run("CREATE INDEX IF NOT EXISTS idx_feedback_task ON feedback(task_id)");
+  sqlJsDb.run("CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status)");
+  sqlJsDb.run("CREATE INDEX IF NOT EXISTS idx_proposals_agent ON proposals(from_agent)");
+  sqlJsDb.run("CREATE INDEX IF NOT EXISTS idx_proposals_type ON proposals(type)");
 }
 
-function migrateColumns(db: Database.Database): void {
-  const columns = db.prepare("PRAGMA table_info('agents')").all() as { name: string }[];
-  const colNames = new Set(columns.map(c => c.name));
+// ============================================================
+// 导出
+// ============================================================
 
-  const migrations: [string, string][] = [
-    ['runtime',        "ALTER TABLE agents ADD COLUMN runtime TEXT NOT NULL DEFAULT 'opencode'"],
-    ['skills',         "ALTER TABLE agents ADD COLUMN skills TEXT NOT NULL DEFAULT '[]'"],
-    ['mcps',           "ALTER TABLE agents ADD COLUMN mcps TEXT NOT NULL DEFAULT '[]'"],
-    ['client_version', "ALTER TABLE agents ADD COLUMN client_version TEXT NOT NULL DEFAULT ''"],
-    ['plugin_hash',    "ALTER TABLE agents ADD COLUMN plugin_hash TEXT NOT NULL DEFAULT ''"],
-    ['daemon_port',    "ALTER TABLE agents ADD COLUMN daemon_port INTEGER NOT NULL DEFAULT 0"],
-  ];
+let dbInstance: DatabaseLike | null = null;
 
-  for (const [col, sql] of migrations) {
-    if (!colNames.has(col)) {
-      db.exec(sql);
-      console.log(`[DB] Migration: added ${col} column to agents table`);
-    }
+export function getDb(): DatabaseLike {
+  if (!sqlJsDb) {
+    throw new Error('[DB] Database not initialized. Call initDb() first.');
   }
-
-  // feishu_user → user_id 重命名迁移（v0.5.0）
-  if (colNames.has('feishu_user') && !colNames.has('user_id')) {
-    db.exec("ALTER TABLE agents RENAME COLUMN feishu_user TO user_id");
-    console.log('[DB] Migration: renamed feishu_user → user_id in agents table');
-
-    // feedback 表
-    const fbCols = db.prepare("PRAGMA table_info('feedback')").all() as { name: string }[];
-    if (fbCols.some(c => c.name === 'feishu_user')) {
-      db.exec("ALTER TABLE feedback RENAME COLUMN feishu_user TO user_id");
-      console.log('[DB] Migration: renamed feishu_user → user_id in feedback table');
-    }
-
-    // proposals 表
-    const prCols = db.prepare("PRAGMA table_info('proposals')").all() as { name: string }[];
-    if (prCols.some(c => c.name === 'feishu_user')) {
-      db.exec("ALTER TABLE proposals RENAME COLUMN feishu_user TO user_id");
-      console.log('[DB] Migration: renamed feishu_user → user_id in proposals table');
-    }
+  if (!dbInstance) {
+    dbInstance = {
+      prepare(sql: string): Statement {
+        return createStatement(sql);
+      },
+      exec(sql: string): void {
+        try {
+          sqlJsDb.run(sql);
+          scheduleSave();
+        } catch (err: any) {
+          console.error(`[DB] exec error: ${err.message}\n  SQL: ${sql.slice(0, 200)}`);
+        }
+      },
+      pragma(str: string): any {
+        if (str.startsWith('table_info')) {
+          const table = str.match(/table_info\('(\w+)'\)/)?.[1];
+          if (table) {
+            try {
+              const stmt = sqlJsDb.prepare(`PRAGMA table_info('${table}')`);
+              const results: any[] = [];
+              while (stmt.step()) results.push(stmt.getAsObject());
+              stmt.free();
+              return results;
+            } catch { return []; }
+          }
+        }
+        try { sqlJsDb.run(`PRAGMA ${str}`); } catch {}
+        return undefined;
+      },
+      close(): void {
+        persistDb();
+        if (sqlJsDb) {
+          sqlJsDb.close();
+          sqlJsDb = null;
+        }
+        dbInstance = null;
+      }
+    };
   }
+  return dbInstance;
 }
 
 export function closeDb(): void {
-  if (db) {
-    db.close();
+  if (dbInstance) {
+    dbInstance.close();
   }
 }

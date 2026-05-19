@@ -4,6 +4,10 @@
 
 [English](./README.en.md) | 中文
 
+## 演示
+
+![demo](./docs/demo.gif)
+
 ## 架构
 
 ```
@@ -42,6 +46,17 @@
 
 ## 快速开始
 
+### 前置条件
+
+- Node.js >= 18
+- AI Runtime：[opencode](https://opencode.ai) 或 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+
+如果尚未安装 Node.js 或版本过低，运行环境准备脚本（自动安装 nvm + Node.js 20）：
+
+```bash
+curl -fsSL https://github.com/fanlvchao/meta-agent-framework/releases/download/latest/env_install.sh | bash
+```
+
 ### 1. 安装
 
 ```bash
@@ -50,6 +65,16 @@ npm install -g https://github.com/fanlvchao/meta-agent-framework/releases/downlo
 
 # Client（Agent 运行的机器，可以多台）
 npm install -g https://github.com/fanlvchao/meta-agent-framework/releases/download/latest/meta-agent-client.tgz
+```
+
+### 卸载
+
+```bash
+# Server
+npm uninstall -g @maf/meta-agent-server
+
+# Client
+npm uninstall -g @maf/meta-agent-client
 ```
 
 ### 2. 启动 Server
@@ -73,6 +98,12 @@ maf-client init    # 交互式配置 Server 地址 + 安装 Plugin
 opencode --agent <name>    # opencode Agent
 claude --agent <name>      # Claude Code Agent
 ```
+
+> ⚠️ **Agent 配置要求**：每个 Agent 项目目录下必须有标准格式的 agent 定义文件：
+> - opencode：`.opencode/agents/<agent-name>.md`（注意是 `agents` 复数）
+> - Claude Code：`.claude/agents/<agent-name>.md`
+>
+> agent 定义文件中的 `model` 字段必须配置实际可用的模型，否则 API 调用会失败（opencode HTTP API 不会像 TUI 一样自动 fallback 默认模型）。
 
 **自动拉起（推荐）：**
 
@@ -107,6 +138,19 @@ maf-client status     # 查看状态
 maf-client uninstall  # 卸载（停 Daemon + 清 Plugin + 删 npm 包）
 maf-client help       # 查看所有命令
 ```
+
+## 安全说明
+
+Meta-Agent-Framework 设计为**内网/局域网部署**，不建议暴露到公网：
+
+- Server 和 Daemon 之间通过 HTTP 通信（无 TLS），仅适用于可信网络
+- 无内置认证机制，同一网段内的机器可直接连接
+- 如需跨公网部署，请自行在前面加 VPN、SSH 隧道或反向代理（nginx + TLS + Basic Auth）
+
+**典型安全部署方式：**
+- 所有机器在同一个 VPN / 局域网内
+- Server 监听内网 IP（如 `10.x.x.x` 或 `192.168.x.x`），不绑定 `0.0.0.0` 到公网端口
+- 防火墙规则限制 Server 端口（默认 3000）和 Daemon 端口（默认 4100）只允许内网访问
 
 ## 开发
 

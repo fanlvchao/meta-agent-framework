@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node scripts/maf-server-hook.mjs --wait",
+            "asyncRewake": true,
+            "timeout": 86400,
+            "statusMessage": "MAF: 等待远端任务结果..."
+          }
+        ]
+      }
+    ]
+  }
+}

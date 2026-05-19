@@ -13,6 +13,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, networkInterfaces } from "node:os";
+import { execSync } from "node:child_process";
 import { createInterface } from "node:readline";
 
 const STATE_DIR = join(homedir(), ".meta-agent-framework");
@@ -200,10 +201,24 @@ if (mode === "server") {
     console.log("     跳过，使用纯自注册模式\n");
   }
 
+  // --- AI Runtime ---
+  console.log("  🤖 AI Runtime 配置\n");
+  console.log("     Server Agent 需要一个 AI Runtime 来运行交互界面。");
+  console.log("     支持 opencode 和 Claude Code，自动检测已安装的 Runtime。\n");
+
+  let detectedRuntime = "";
+  try { execSync("which opencode", { stdio: "pipe" }); detectedRuntime = "opencode"; } catch {}
+  if (!detectedRuntime) { try { execSync("which claude", { stdio: "pipe" }); detectedRuntime = "claude"; } catch {} }
+
+  const runtimeDefault = existing?.server?.runtime || detectedRuntime || "opencode";
+  const runtimeAnswer = await ask("  Runtime (opencode/claude)", runtimeDefault);
+  const runtime = ["opencode", "claude"].includes(runtimeAnswer) ? runtimeAnswer : runtimeDefault;
+  console.log(`\n     ✅ Runtime: ${runtime}\n`);
+
   // --- 生成配置 ---
   const config = {
     role: "server",
-    server: { url: serverUrl, port: serverPort },
+    server: { url: serverUrl, port: serverPort, runtime },
     daemon: { port: daemonPort },
     registry: { type: registryType },
     feishu: {

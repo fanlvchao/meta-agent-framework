@@ -4,6 +4,10 @@
 
 English | [中文](./README.md)
 
+## Demo
+
+![demo](./docs/demo.gif)
+
 ## Architecture
 
 ```
@@ -73,6 +77,12 @@ Two modes of operation after installation:
 opencode --agent <name>    # opencode Agent
 claude --agent <name>      # Claude Code Agent
 ```
+
+> ⚠️ **Agent Configuration Requirements**: Each Agent project directory must contain a standard agent definition file:
+> - opencode: `.opencode/agents/<agent-name>.md` (note: `agents` plural)
+> - Claude Code: `.claude/agents/<agent-name>.md`
+>
+> The `model` field in the agent definition must specify an actually available model. The opencode HTTP API does not fallback to a default model like the TUI does — an invalid model will cause API calls to fail silently.
 
 **Auto-launch (recommended):**
 

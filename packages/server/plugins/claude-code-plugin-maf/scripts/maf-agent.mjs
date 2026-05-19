@@ -68,7 +68,8 @@ function detectAgentName() {
       if (first) return first.replace(/\.md$/, "");
     }
   } catch {}
-  return `claude-agent-${homedir().split("/").pop()}`;
+  // 检测不到 agent name → 返回空（不注册，避免幽灵 agent）
+  return "";
 }
 
 function findClaudePid() {
@@ -153,7 +154,18 @@ async function connectAgent(agentName) {
 // DAEMON 模式：确保 Node Daemon 运行 + 注册 agent
 // ============================================================
 if (MODE === "daemon") {
+  // Server 环境检测：cwd 含 .meta-agent-framework → 是 Server TUI，不需要 Client Plugin 注册
+  const cwd = process.cwd();
+  if (cwd.includes(".meta-agent-framework")) {
+    log("跳过: Server 环境，不注册 Client agent");
+    process.exit(0);
+  }
+
   const agentName = detectAgentName();
+  if (!agentName) {
+    log("跳过: 无法检测到 agent name，不注册");
+    process.exit(0);
+  }
   log(`Daemon 模式: agent=${agentName}`);
 
   // 检查 Node Daemon 是否已运行
@@ -187,7 +199,18 @@ if (MODE === "daemon") {
 // WAIT 模式：long-poll Node Daemon 等任务 → exit 2 唤醒 Claude
 // ============================================================
 } else {
+  // Server 环境 或 无 agent name → 不等任务
+  const cwd = process.cwd();
+  if (cwd.includes(".meta-agent-framework")) {
+    log("跳过: Server 环境，不启动 wait");
+    process.exit(0);
+  }
+
   const agentName = detectAgentName();
+  if (!agentName) {
+    log("跳过: 无法检测到 agent name，不启动 wait");
+    process.exit(0);
+  }
   const FAIL_MAX = 5;
   let fails = 0;
 
@@ -207,8 +230,23 @@ if (MODE === "daemon") {
   // 确保 agent 已注册到 Node Daemon（Daemon 重启后需要重新注册）
   await connectAgent(agentName);
 
+  // 父进程存活检测：claude 退出后自己也退出，防止资源泄漏
+  const claudePid = findClaudePid();
+  function isParentAlive() {
+    if (claudePid > 0) {
+      try { process.kill(claudePid, 0); return true; } catch { return false; }
+    }
+    try { process.kill(process.ppid, 0); return true; } catch { return false; }
+  }
+
   // Long-poll 循环
   while (true) {
+    // 父进程检测：claude 退出了就自杀
+    if (!isParentAlive()) {
+      log(`Claude 进程已退出 (pid=${claudePid || process.ppid})，wait 自动退出`);
+      process.exit(0);
+    }
+
     try {
       const res = await fetch(`${DAEMON_URL}/tasks/wait?agent=${encodeURIComponent(agentName)}`, {
         signal: AbortSignal.timeout(10000),
@@ -242,8 +280,10 @@ if (MODE === "daemon") {
 
         const msg = `[MAF 远程任务] ${task.description || task.title}
 
-执行完成后用以下命令回报结果:
-curl -s -X POST ${DAEMON_URL}/tasks/done -H 'Content-Type: application/json' -d '{"task_id":"${task.id}","agent_name":"${agentName}","status":"completed","result":"<简述结果>"}'`;
+执行完成后用以下命令回报结果（重要：检查响应中的 next_task 字段，如果有则继续执行下一个任务）:
+curl -s -X POST ${DAEMON_URL}/tasks/done -H 'Content-Type: application/json' -d '{"task_id":"${task.id}","agent_name":"${agentName}","status":"completed","result":"<你的执行结果>"}'
+
+回报后如果响应里有 "next_task" 字段（不为 null），说明队列里还有任务，请立即执行 next_task.description 中的内容，完成后再次用同样的 curl 回报（替换 task_id 为 next_task.id，result 为新结果）。循环直到 next_task 为 null。`;
 
         process.stderr.write(msg);
         process.exit(2);
@@ -251,18 +291,37 @@ curl -s -X POST ${DAEMON_URL}/tasks/done -H 'Content-Type: application/json' -d 
     } catch {
       fails++;
       if (fails >= FAIL_MAX) {
-        // Node Daemon 不可达——可能是 OTA 自更新重启，尝试拉起
-        log(`Node Daemon 不可达 ${fails} 次，尝试重新拉起...`);
-        const ok = await spawnNodeDaemon(agentName);
-        if (ok) {
-          // 重新连接 agent
-          await connectAgent(agentName);
-          fails = 0;
-          log(`✅ Node Daemon 恢复 port=${NODE_PORT}`);
-          continue;
+        // Node Daemon 不可达——持续重试直到连上
+        log(`Node Daemon 不可达 ${fails} 次，等待恢复...`);
+        fails = 0;
+
+        // 循环等待 Daemon 可达（不退出）
+        while (true) {
+          await new Promise(r => setTimeout(r, 3000));
+
+          // 检查是否有人拉起了
+          const h = await checkDaemon();
+          if (h) {
+            log(`✅ Node Daemon 恢复 (pid=${h.pid})，重新连接`);
+            await connectAgent(agentName);
+            break;
+          }
+
+          // 自己尝试拉起
+          const ok = await spawnNodeDaemon(agentName);
+          if (ok) {
+            await connectAgent(agentName);
+            log(`✅ Node Daemon 拉起成功 port=${NODE_PORT}`);
+            break;
+          }
+
+          // 父进程检测：claude 都退了就没必要继续了
+          if (!isParentAlive()) {
+            log(`Claude 已退出，wait 退出`);
+            process.exit(0);
+          }
         }
-        log(`❌ 无法恢复 Node Daemon，退出`);
-        process.exit(0);
+        continue;
       }
       await new Promise(r => setTimeout(r, 1000));
     }

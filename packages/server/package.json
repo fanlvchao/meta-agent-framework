@@ -1,6 +1,6 @@
 {
   "name": "@maf/meta-agent-server",
-  "version": "0.4.6",
+  "version": "0.4.8",
   "description": "Meta-Agent-Framework Server — 分布式 AI Agent 编排调度中心",
   "main": "src/index.ts",
   "bin": {
@@ -13,7 +13,8 @@
     "status": "node bin/maf-server.mjs status",
     "server": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
-    "build": "tsc"
+    "build": "tsc",
+    "postinstall": "node bin/maf-server.mjs sync-plugins 2>/dev/null || true"
   },
   "keywords": [
     "ai",
@@ -24,27 +25,32 @@
   ],
   "author": "fanlvchao <fanlvchao@gmail.com>",
   "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "type": "commonjs",
   "files": [
     "bin/",
     "src/",
     "scripts/maf-init.mjs",
+    "scripts/maf-server-hook.mjs",
     "scripts/poll-workflow.sh",
     "scripts/push-skill.sh",
     "plugins/",
     "skills/",
     ".opencode/",
+    ".claude/",
+    "CLAUDE.md",
     "start.sh",
     "tsconfig.json"
   ],
   "dependencies": {
-    "better-sqlite3": "^12.9.0",
     "express": "^5.2.1",
+    "sql.js": "^1.14.1",
     "tsx": "^4.21.0",
     "uuid": "^13.0.0"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
     "@types/express": "^5.0.6",
     "@types/node": "^25.6.0",
     "@types/uuid": "^10.0.0",

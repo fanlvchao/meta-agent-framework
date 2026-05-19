@@ -308,6 +308,11 @@ export class AgentRegistry {
     return getDb().prepare('SELECT * FROM agents WHERE id = ?').get(id) as Agent | undefined;
   }
 
+  deleteById(id: string): boolean {
+    const result = getDb().prepare('DELETE FROM agents WHERE id = ?').run(id);
+    return result.changes > 0;
+  }
+
   listAll(): Agent[] {
     return getDb().prepare('SELECT * FROM agents ORDER BY user_id, agent_name').all() as Agent[];
   }

@@ -150,15 +150,15 @@ function isProcessAlive(pid) {
 function pruneDeadAgents() {
   const now = Date.now();
   for (const [name, info] of agents) {
-    if (info.runtime === "claude-code") continue;  // CC 模式不用 long-poll，不清理
     const q = taskQueues.get(name);
     if (q?.executingTaskId) continue;  // 正在执行任务，不清理
 
     // Plugin 进程还活着，不清理
-    if (isProcessAlive(info.pluginPid)) continue;
+    if (info.pluginPid && isProcessAlive(info.pluginPid)) continue;
 
-    // lastSeen 还没超时，不清理（刚退出的短暂窗口期，可能马上重连）
-    if (info.lastSeen && now - info.lastSeen <= AGENT_ALIVE_TIMEOUT) continue;
+    // claude-code 模式：--wait 每 10s poll 刷新 lastSeen，15s 无刷新 = 死了
+    const timeout = info.runtime === "claude-code" ? 15_000 : AGENT_ALIVE_TIMEOUT;
+    if (info.lastSeen && now - info.lastSeen <= timeout) continue;
 
     // 有 screen 在跑（按需拉起的 TUI），不清理
     const screenName = `maf-${name}`;
@@ -183,9 +183,25 @@ function getAgentStatuses() {
   for (const [name, info] of agents) {
     const q = taskQueues.get(name);
 
-    // claude-code 模式：没有持续 long-poll，只在 connect/wait 时刷新，不能用短超时判断
+    // claude-code 模式：--wait 进程每 10s poll 一次刷新 lastSeen
+    // lastSeen 在 15s 内 → 在线（--wait 活着）；超过 → 离线（--wait 死了）
     if (info.runtime === "claude-code") {
-      statuses[name] = q?.executingTaskId ? "busy" : "online";
+      if (q?.executingTaskId) {
+        statuses[name] = "busy";
+      } else if (info.pluginPid && isProcessAlive(info.pluginPid)) {
+        statuses[name] = "online";
+      } else if (info.lastSeen && now - info.lastSeen <= 15_000) {
+        statuses[name] = "online";
+      } else {
+        // lastSeen 超时，检查是否有 screen 在跑（按需拉起的）
+        const screenName = `maf-${name}`;
+        let hasScreen = false;
+        try {
+          const check = execSync(`screen -ls ${screenName} 2>/dev/null`, { encoding: "utf-8", timeout: 2000 });
+          hasScreen = check.includes(screenName);
+        } catch {}
+        statuses[name] = hasScreen ? "online" : "offline";
+      }
       continue;
     }
 
@@ -1264,7 +1280,21 @@ const httpServer = createServer(async (req, res) => {
     if (!task) task = { id: body.task_id };
 
     reportTaskResult(task, body.status, body.result || "", body.duration_ms || 0);
-    json(200, { ok: true });
+
+    // Claude Code 模式：检查队列是否有下一个任务（续传，避免等 asyncRewake）
+    // opencode 模式不续传（它用 long-poll 自己取）
+    let nextTask = null;
+    const agentInfo = agentName ? agents.get(agentName) : null;
+    if (agentInfo?.runtime === "claude-code" && agentName && taskQueues.has(agentName)) {
+      const q = taskQueues.get(agentName);
+      if (q.pending.length > 0) {
+        nextTask = q.pending.shift();
+        q.lastExecuted = nextTask;
+        q.executingTaskId = nextTask.id;
+        log(`📋 ${agentName} 续传下一个任务: "${nextTask.title}"`);
+      }
+    }
+    json(200, { ok: true, next_task: nextTask });
     return;
   }
 

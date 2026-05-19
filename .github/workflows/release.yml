@@ -18,7 +18,7 @@ jobs:
           node-version: 20
 
       - name: Install server dependencies
-        run: cd packages/server && npm ci
+        run: cd packages/server && npm ci --registry https://registry.npmjs.org
 
       - name: Pack server
         run: cd packages/server && npm pack
@@ -40,6 +40,7 @@ jobs:
           files: |
             packages/server/meta-agent-server.tgz
             packages/client/meta-agent-client.tgz
+            env_install.sh
 
       # Update "latest" release — always points to the newest version
       # This enables a stable install URL:
@@ -54,14 +55,25 @@ jobs:
 
             ## Install
             ```bash
+            # 1. 环境准备（自动安装 Node.js，已有则跳过）
+            curl -fsSL https://github.com/fanlvchao/meta-agent-framework/releases/download/latest/env_install.sh | bash
+
+            # 2. 安装 Server 或 Client
             npm install -g https://github.com/fanlvchao/meta-agent-framework/releases/download/latest/meta-agent-server.tgz
             npm install -g https://github.com/fanlvchao/meta-agent-framework/releases/download/latest/meta-agent-client.tgz
+            ```
+
+            ## Uninstall
+            ```bash
+            npm uninstall -g @maf/meta-agent-server
+            npm uninstall -g @maf/meta-agent-client
             ```
           prerelease: false
           make_latest: false
           files: |
             packages/server/meta-agent-server.tgz
             packages/client/meta-agent-client.tgz
+            env_install.sh
 
       # Move the "latest" tag to current commit so next run replaces it
       - name: Force-update latest tag

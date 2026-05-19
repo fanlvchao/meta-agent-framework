@@ -19,7 +19,7 @@
  *   maf.config.json  配置文件
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, openSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, openSync, cpSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { homedir, networkInterfaces } from "node:os";
 import { execSync, spawn } from "node:child_process";
@@ -41,6 +41,60 @@ const CONFIG_FILE = join(MAF_HOME, "maf.config.json");
 // 确保目录
 mkdirSync(STATE_DIR, { recursive: true });
 mkdirSync(join(MAF_HOME, "data"), { recursive: true });
+
+// ============================================================
+// 工作区同步：将 npm 包中的 agent/hook/scripts 同步到 MAF_HOME
+// ============================================================
+
+/** 需要同步到 MAF_HOME 的文件/目录（来自 PACKAGE_ROOT） */
+const SYNC_ITEMS = [
+  ".opencode",               // opencode agent 定义 + rules + skills
+  ".claude",                 // claude hooks 配置
+  "CLAUDE.md",              // claude system prompt
+  "scripts/maf-server-hook.mjs",  // claude asyncRewake hook
+  "scripts/poll-workflow.sh",     // 工作流轮询脚本
+  "scripts/push-skill.sh",       // skill 推送脚本
+];
+
+/**
+ * 同步工作区文件到 MAF_HOME。
+ * 每次启动时覆盖（确保升级后新版本文件生效）。
+ * 同时同步 opencode Plugin 到 ~/.config/opencode/plugins/（npm install -g 不会更新这里）。
+ */
+function syncWorkspace() {
+  mkdirSync(join(MAF_HOME, "scripts"), { recursive: true });
+
+  for (const item of SYNC_ITEMS) {
+    const src = join(PACKAGE_ROOT, item);
+    const dst = join(MAF_HOME, item);
+    if (!existsSync(src)) continue;
+
+    try {
+      cpSync(src, dst, { recursive: true, force: true });
+    } catch (err) {
+      // 静默忽略，不影响启动
+    }
+  }
+
+  // 同步 opencode Plugin（整个目录覆盖）
+  const pluginSrc = join(PACKAGE_ROOT, "plugins", "opencode-plugin-meta-agent-framework");
+  const pluginDst = join(homedir(), ".config", "opencode", "plugins", "opencode-plugin-meta-agent-framework");
+  if (existsSync(pluginSrc) && existsSync(pluginDst)) {
+    try { cpSync(pluginSrc, pluginDst, { recursive: true, force: true }); } catch {}
+  }
+
+  // 同步 Claude Code Plugin（整个 marketplace 目录覆盖）
+  const ccMarketSrc = join(PACKAGE_ROOT, "plugins", ".claude-plugin");
+  const ccMarketDst = join(homedir(), ".claude", "plugins", "marketplaces", "maf-plugins", ".claude-plugin");
+  if (existsSync(ccMarketSrc) && existsSync(ccMarketDst)) {
+    try { cpSync(ccMarketSrc, ccMarketDst, { recursive: true, force: true }); } catch {}
+  }
+  const ccPluginSrc = join(PACKAGE_ROOT, "plugins", "claude-code-plugin-maf");
+  const ccPluginDst = join(homedir(), ".claude", "plugins", "marketplaces", "maf-plugins", "claude-code-plugin-maf");
+  if (existsSync(ccPluginSrc) && existsSync(ccPluginDst)) {
+    try { cpSync(ccPluginSrc, ccPluginDst, { recursive: true, force: true }); } catch {}
+  }
+}
 
 // ============================================================
 // 工具函数
@@ -130,6 +184,9 @@ async function cmdStart() {
       process.exit(1);
     }
   }
+
+  // 同步工作区文件到 MAF_HOME（每次启动覆盖，确保升级后生效）
+  syncWorkspace();
 
   // 确保依赖已安装（首次运行 npm install）
   const nodeModules = join(PACKAGE_ROOT, "node_modules");
@@ -270,18 +327,95 @@ function cmdLogs() {
   process.exit(0);  // 直接退出，不走 main().then()
 }
 
+function detectRuntime() {
+  // 优先级：命令行参数（仅 opencode/claude）> 配置文件 > 默认 opencode
+  const argRuntime = process.argv[3];
+  if (argRuntime && ["opencode", "claude"].includes(argRuntime)) {
+    saveRuntime(argRuntime);
+    return argRuntime;
+  }
+
+  const cfg = readConfig();
+  if (cfg?.server?.runtime) return cfg.server.runtime;
+
+  return "opencode";
+}
+
+/** 获取 tui 命令后面的额外参数（排除 runtime 参数） */
+function getTuiExtraArgs() {
+  const args = process.argv.slice(3);
+  if (args[0] && ["opencode", "claude"].includes(args[0])) {
+    return args.slice(1).join(" ");
+  }
+  return args.join(" ");
+}
+
+function saveRuntime(runtime) {
+  try {
+    const cfg = readConfig() || {};
+    if (!cfg.server) cfg.server = {};
+    cfg.server.runtime = runtime;
+    writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2) + "\n");
+  } catch {}
+}
+
 function cmdTui() {
-  // 在包目录下启动 opencode，这样 .opencode/agents/ 和 scripts/ 都可达
+  // 在包目录下启动 TUI agent（支持 opencode 和 claude）
   if (!isServerRunning()) {
     console.log("⚠️  Server 未运行，先启动...");
     execSync(`node "${join(PACKAGE_ROOT, "bin", "maf-server.mjs")}" start`, { stdio: "inherit" });
   }
-  console.log(`📂 工作目录: ${PACKAGE_ROOT}`);
-  try {
-    execSync("opencode --agent Meta-Agent-Server --hostname localhost", { cwd: PACKAGE_ROOT, stdio: "inherit" });
-  } catch {
-    // 用户退出 opencode
+
+  const runtime = detectRuntime();
+  if (!runtime) {
+    console.error("❌ 未检测到 opencode 或 claude，请先安装其中之一：");
+    console.error("   opencode: https://opencode.ai");
+    console.error("   claude:   npm install -g @anthropic-ai/claude-code");
+    process.exit(1);
   }
+
+  // 确保工作区已同步
+  syncWorkspace();
+
+  // 读取上次的 session ID（用于恢复对话）
+  const sessionFile = join(MAF_HOME, "state", "last-session");
+  let lastSession = "";
+  try { lastSession = readFileSync(sessionFile, "utf-8").trim(); } catch {}
+
+  console.log(`📂 工作目录: ${MAF_HOME}`);
+  console.log(`🤖 运行时:   ${runtime}`);
+  if (lastSession) console.log(`🔄 恢复会话: ${lastSession}`);
+
+  const extraArgs = getTuiExtraArgs();
+
+  try {
+    if (runtime === "opencode") {
+      const sessionArg = lastSession && !extraArgs.includes("-s ") ? `-s ${lastSession}` : "";
+      const cmd = `opencode --agent Meta-Agent-Server --hostname localhost ${sessionArg} ${extraArgs}`.trim();
+      execSync(cmd, { cwd: MAF_HOME, stdio: "inherit" });
+    } else {
+      // Claude Code: --resume 恢复上次对话
+      const resumeArg = lastSession && !extraArgs.includes("--resume") ? `--resume ${lastSession}` : "";
+      const cmd = `claude ${resumeArg} ${extraArgs}`.trim();
+      execSync(cmd, { cwd: MAF_HOME, stdio: "inherit" });
+    }
+  } catch {
+    // 用户退出 TUI
+  }
+
+  // 退出后保存当前 session ID（从 opencode 的状态文件读取）
+  try {
+    // opencode 在 .opencode/state/ 下保存 session 信息
+    const stateDir = join(MAF_HOME, ".opencode", "state");
+    if (existsSync(stateDir)) {
+      const files = require("fs").readdirSync(stateDir).filter(f => f.endsWith(".json")).sort();
+      if (files.length > 0) {
+        const latest = JSON.parse(readFileSync(join(stateDir, files[files.length - 1]), "utf-8"));
+        if (latest.id) writeFileSync(sessionFile, latest.id);
+      }
+    }
+  } catch {}
+
   process.exit(0);
 }
 
@@ -321,24 +455,25 @@ function cmdHelp() {
   console.log(`
 Meta-Agent-Framework Server
 
-用法: maf-server <command>
+用法: maf-server <command> [runtime]
 
 命令:
-  start       启动 Server（首次自动配置）
-  stop        停止 Server
-  restart     重启 Server
-  tui         进入 Meta-Agent-Server 交互界面
-  status      查看运行状态
-  logs        查看日志（tail -f）
-  version     版本信息
-  uninstall   卸载 Server（停止 + 清数据 + 删包）
-  help        显示此帮助
+  start         启动 Server（首次自动配置）
+  stop          停止 Server
+  restart       重启 Server
+  tui [runtime] 进入交互界面（opencode 或 claude，默认上次使用的）
+  status        查看运行状态
+  logs          查看日志（tail -f）
+  version       版本信息
+  uninstall     卸载 Server（停止 + 清数据 + 删包）
+  help          显示此帮助
 
 数据目录: ${MAF_HOME}
 
 快速开始:
-  1. maf-server start      # 首次自动配置 + 启动
-  2. maf-server status     # 确认
+  1. maf-server start         # 首次自动配置 + 启动
+  2. maf-server tui           # 进入交互界面（默认 opencode）
+  3. maf-server tui claude    # 用 Claude Code
 `);
 }
 
@@ -360,6 +495,7 @@ async function main() {
     case "uninstall": cmdUninstall(); break;
     case "version": case "--version": case "-v": cmdVersion(); break;
     case "help": case "--help": case "-h": cmdHelp(); break;
+    case "sync-plugins": syncWorkspace(); break;
     default:
       console.error(`未知命令: ${cmd}`);
       cmdHelp();

@@ -147,8 +147,52 @@ const pluginInstances = new Map<string, any[]>();
  * 插件模式下 client_endpoint 不一定有 HTTP server（TUI 模式没有），
  * 探活会误报，所以只信任心跳机制。
  */
-router.get('/agents', (_req: Request, res: Response) => {
-  res.json(agentRegistry.listAll());
+/**
+ * GET /api/agents
+ * 支持 ?fields=agent_name,status,runtime 过滤返回字段（逗号分隔）
+ * 默认去重：同名 agent 只保留状态最优的（online > offline > dead）
+ * ?all=true 返回全部（含重复）
+ */
+router.get('/agents', (req: Request, res: Response) => {
+  let agents = agentRegistry.listAll();
+
+  // 默认去重：同名 agent 只保留最新的（最近心跳）
+  if (req.query.all !== 'true') {
+    const latest = new Map<string, typeof agents[0]>();
+    for (const a of agents) {
+      const existing = latest.get(a.agent_name);
+      if (!existing || a.last_heartbeat > existing.last_heartbeat) {
+        latest.set(a.agent_name, a);
+      }
+    }
+    agents = [...latest.values()];
+  }
+
+  const fieldsParam = req.query.fields as string | undefined;
+  if (!fieldsParam) {
+    res.json(agents);
+    return;
+  }
+  const fields = fieldsParam.split(',').map(f => f.trim());
+  res.json(agents.map(a => {
+    const filtered: Record<string, any> = {};
+    for (const f of fields) {
+      if (f in a) filtered[f] = (a as any)[f];
+    }
+    return filtered;
+  }));
+});
+
+/** DELETE /api/agents/:id — 删除指定 agent 记录（清理 dead/过期） */
+router.delete('/agents/:id', (req: Request, res: Response) => {
+  const id = req.params.id as string;
+  const agent = agentRegistry.getById(id);
+  if (!agent) {
+    res.status(404).json({ error: 'Agent not found' });
+    return;
+  }
+  agentRegistry.deleteById(id);
+  res.json(agent);
 });
 
 /** GET /api/agents/stats */

@@ -386,7 +386,8 @@ export const MetaAgentBridge = async ({ client, serverUrl, project, directory })
   // 优先级：MAF_INITIAL_AGENT 环境变量 > --agent 命令行参数
   const detectedAgent = process.env.MAF_INITIAL_AGENT
     || (() => { const i = process.argv.indexOf("--agent"); return i !== -1 ? process.argv[i + 1] : ""; })();
-  if (detectedAgent) {
+  // Meta-Agent-Server 是管理者，不注册为 Client Agent
+  if (detectedAgent && detectedAgent !== "Meta-Agent-Server") {
     log(`🔗 启动时检测到 agent: ${detectedAgent}，直接 connect`);
     activeAgent = detectedAgent;
     notifyDaemon("/agents/connect", {
@@ -395,6 +396,9 @@ export const MetaAgentBridge = async ({ client, serverUrl, project, directory })
       plugin_pid: process.pid,
       directory,
     });
+  } else if (detectedAgent === "Meta-Agent-Server") {
+    log(`ℹ️ Meta-Agent-Server 是管理者，不注册为 Client Agent`);
+    activeAgent = detectedAgent;
   }
 
   // ============================================================
@@ -628,9 +632,8 @@ export const MetaAgentBridge = async ({ client, serverUrl, project, directory })
                   // Meta-Agent-Server 是管理者，接收所有 workflow 结果
                   // 其他 agent 只接收与自己相关的结果
                   const isManager = activeAgent === "Meta-Agent-Server";
-                  const isRelevant = isManager || !activeAgent
-                    || data.data?.nodes?.some(n => n.agent_name === activeAgent)
-                    || data.data?.title?.includes(activeAgent);
+                  const isRelevant = isManager
+                    || data.data?.nodes?.some(n => n.agent_name === activeAgent);
                   if (isRelevant) {
                     pendingResults.push({
                       type: eventType,
@@ -709,6 +712,10 @@ export const MetaAgentBridge = async ({ client, serverUrl, project, directory })
       pendingResults.unshift(...results);
     } finally {
       isRemoteTaskExecuting = false;
+      // 注入完成后检查队列是否还有待处理的结果（注入期间新到达的）
+      if (pendingResults.length > 0) {
+        setTimeout(() => injectPendingResults(), 2000);
+      }
     }
   }
 
@@ -766,6 +773,8 @@ export const MetaAgentBridge = async ({ client, serverUrl, project, directory })
       if (newAgent && newAgent !== activeAgent) {
         log(`🔄 agent: ${activeAgent || "-"} → ${newAgent}`);
         activeAgent = newAgent;
+        // Meta-Agent-Server 是管理者，不注册为 Client Agent
+        if (newAgent === "Meta-Agent-Server") return;
         // 通知 Node Daemon 连接此 agent
         notifyDaemon("/agents/connect", {
           agent_name: newAgent, runtime: "opencode",

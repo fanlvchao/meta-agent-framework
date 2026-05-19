@@ -2,7 +2,7 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
-import { getDb, closeDb } from './db/database';
+import { initDb, getDb, closeDb } from './db/database';
 import { healthMonitor } from './services/health-monitor';
 import { getRegistry } from './services/registry';
 import { agentRegistry } from './services/agent-registry';
@@ -215,9 +215,10 @@ async function reconcileWithRegistry(): Promise<void> {
 
 // --- Start ---
 async function start(): Promise<void> {
-  // 初始化数据库
+  // 初始化数据库（sql.js 异步加载 WASM/asm）
+  await initDb();
   const db = getDb();
-  console.log('[DB] SQLite initialized');
+  console.log('[DB] SQLite initialized (sql.js)');
 
   // 启动时全部重置为 offline，等 Client 注册/心跳再恢复
   const reset = db.prepare("UPDATE agents SET status = 'offline' WHERE status IN ('online', 'busy')").run();
