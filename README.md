@@ -54,17 +54,17 @@
 如果尚未安装 Node.js 或版本过低，运行环境准备脚本（自动安装 nvm + Node.js 20）：
 
 ```bash
-curl -fsSL https://github.com/fanlvchao/meta-agent-framework/releases/download/latest/env_install.sh | bash
+curl -fsSL https://github.com/dendronmind/meta-agent-framework/releases/download/latest/env_install.sh | bash
 ```
 
 ### 1. 安装
 
 ```bash
 # Server（调度中心，一台机器）
-npm install -g https://github.com/fanlvchao/meta-agent-framework/releases/download/latest/meta-agent-server.tgz
+npm install -g https://github.com/dendronmind/meta-agent-framework/releases/download/latest/meta-agent-server.tgz
 
 # Client（Agent 运行的机器，可以多台）
-npm install -g https://github.com/fanlvchao/meta-agent-framework/releases/download/latest/meta-agent-client.tgz
+npm install -g https://github.com/dendronmind/meta-agent-framework/releases/download/latest/meta-agent-client.tgz
 ```
 
 ### 卸载

@@ -3,7 +3,7 @@
 # Meta-Agent-Framework 环境准备
 #
 # 用法：
-#   curl -fsSL https://github.com/fanlvchao/meta-agent-framework/releases/download/latest/env_install.sh | bash
+#   curl -fsSL https://github.com/dendronmind/meta-agent-framework/releases/download/latest/env_install.sh | bash
 #
 # 检测 Node.js 版本，不够则自动通过 nvm 安装 Node.js 20。
 #

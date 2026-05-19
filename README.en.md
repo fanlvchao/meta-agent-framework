@@ -50,10 +50,10 @@ English | [中文](./README.md)
 
 ```bash
 # Server (one machine as orchestrator)
-npm install -g https://github.com/fanlvchao/meta-agent-framework/releases/download/latest/meta-agent-server.tgz
+npm install -g https://github.com/dendronmind/meta-agent-framework/releases/download/latest/meta-agent-server.tgz
 
 # Client (machines running Agents, can be many)
-npm install -g https://github.com/fanlvchao/meta-agent-framework/releases/download/latest/meta-agent-client.tgz
+npm install -g https://github.com/dendronmind/meta-agent-framework/releases/download/latest/meta-agent-client.tgz
 ```
 
 ### 2. Start Server
